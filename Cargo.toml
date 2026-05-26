@@ -1,0 +1,107 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+[workspace]
+
+[workspace.package]
+version = "0.2.3"
+edition = "2021"
+license = "MPL-2.0"
+authors = ["touchHLE project contributors"]
+homepage = "https://touchhle.org/"
+
+[package]
+name = "touchHLE"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+homepage = { workspace = true }
+
+[lib]
+# https://users.rust-lang.org/t/making-both-binary-and-cdylib-from-one-package/29105
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "touchHLE"
+path = "src/bin.rs"
+
+[features]
+default = ["static"]
+static = ["sdl2/bundled", "sdl2/static-link", "touchHLE_openal_soft_wrapper/static"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[workspace.dependencies]
+cc = "1.0.83"
+cmake = "0.1.49"
+gl_generator = "0.14.0"
+
+[dependencies]
+hound = "3.5.0"
+mach_object = "0.1.17"
+plist = "1.8.0"
+zip = { version = "0.6.4", default-features = false, features = ["deflate"] }
+rusttype = "0.9.3"
+# While most Symphonia codecs are (likely) unpatented/have freely licenseable 
+# patents as of 2024, all of the AAC profiles except AAC-LC (likely) have 
+# active patent claims. The "aac" feature only enables AAC-LC, so it's should 
+# be ok.
+# (The above statements should not understood as legal claims/advice.)
+symphonia = { version = "0.6.0-alpha.1", default-features = false, features = [
+    # formats
+    "caf", "isomp4", "wav",
+    # codecs
+    "aac", "adpcm", "alac", "mp3", "pcm"
+] }
+quick-xml = "0.38.4"
+digest = "0.10.7"
+md-5 = "0.10.6"
+sha1 = "0.10.6"
+encoding_rs = "0.8.35"
+# We currently use a fork of rust-sdl2 because we need a fix for Android builds
+# that's not upstream yet.
+# The HIDAPI feature is enabled because rust-sdl2 hides the SDL2 sensor features
+# behind this, but the actual HIDAPI is not used by touchHLE (see window.rs).
+# Note that the submodule in vendor/SDL2/ must use exactly the same revision of
+# SDL2 that rust-sdl2 uses, so that the Android JNI interface matches.
+sdl2 = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3", features = ["hidapi"] }
+sdl2-sys = { git = "https://github.com/touchHLE/rust-sdl2", tag = "touchHLE-3" }
+touchHLE_dynarmic_wrapper = { path = "src/cpu/dynarmic_wrapper" }
+touchHLE_gl_bindings = { path = "src/gles/gl_bindings" }
+touchHLE_openal_soft_wrapper = { path = "src/audio/openal_soft_wrapper" }
+touchHLE_pvrt_decompress_wrapper = { path = "src/image/pvrt_decompress_wrapper" }
+touchHLE_stb_image_wrapper = { path = "src/image/stb_image_wrapper" }
+touchHLE_version = { path = "src/version" }
+windows-sys = { version = "0.61.0", features = ["Win32_System_Memory", "Win32_System_Time"] }
+nibarchive = "0.1.0"
+libc = "0.2.180"
+corosensei = "0.3.2"
+uuid = { version = "1.2.2", default-features = false, features = ["v4"] }
+# Audio metadata reader so the simulated iPod library can surface real song
+# titles (ID3v2 / iTunes M4A / FLAC / Vorbis) instead of the bare filename.
+lofty = { version = "0.21", default-features = false }
+# Native folder picker for the music-library setup so users can point
+# touchHLE at a real folder of audio files. rfd doesn't build for Android
+# (no native folder picker there); on Android we fall back to scanning the
+# app's external-files dir (see music_library.rs / saved_library_path),
+# so the runtime never calls into rfd on that platform.
+#
+# rodio is also excluded on Android: cpal's Android backend is oboe, which
+# requires `ndk_context::initialize_android_context()` to be called first
+# (it isn't -- touchHLE doesn't wire JNI through ndk-context), so the first
+# oboe call panics with "android context was not initialized". The picker
+# preview audio is the only user of rodio, and `play_song`/`stop_song_preview`
+# are stubbed to no-ops on Android in music_library.rs.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = { version = "0.15.4", default-features = false }
+# Plays the picked song to the host's default audio output so the picker
+# experience matches a real iPod: tap a row, hear the track. Uses its own
+# cpal backend independently of the guest OpenAL pipeline.
+rodio = { version = "0.20", default-features = false, features = ["mp3", "wav", "flac", "vorbis", "symphonia-aac", "symphonia-isomp4"] }
+
+[build-dependencies]
+cargo-license = "0.5.1"
+cc = { workspace = true }
+cmake = { workspace = true }
+gl_generator = { workspace = true }

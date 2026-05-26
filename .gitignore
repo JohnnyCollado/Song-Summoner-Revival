@@ -1,0 +1,111 @@
+# =====================================================================
+# .gitignore for the touchHLE + Song Summoner fork.
+#
+# Categories below:
+#   1. Build outputs (Rust + Android + native)
+#   2. Editor / IDE / OS cruft
+#   3. Runtime logs and per-user state
+#   4. Bundled apps and personal media (copyright + privacy)
+#   5. Release artifacts (zips, packed distro folders)
+#   6. RE / inspect outputs (unpacked .ipa)
+# =====================================================================
+
+# ----------------------------------------------------------------------
+# 1. Build outputs
+# ----------------------------------------------------------------------
+/target
+/vendor/boost
+/build
+/captures
+.externalNativeBuild
+.cxx
+.gradle
+/local.properties
+local.properties
+android/app/src/main/jniLibs
+android/app/build
+android/build
+
+# ----------------------------------------------------------------------
+# 2. Editor / IDE / OS cruft
+# ----------------------------------------------------------------------
+*.iml
+.idea/
+.vscode/
+.vs/
+.DS_Store
+Thumbs.db
+desktop.ini
+.claude/
+
+# ----------------------------------------------------------------------
+# 3. Runtime logs and per-user state
+# ----------------------------------------------------------------------
+# Logs touchHLE writes on every launch -- always regenerable.
+run.log
+touchHLE_log.txt
+DUMP.txt
+
+# Per-user options/cache that contain absolute paths from the
+# developer's machine. The committed defaults are
+# touchHLE_default_options.txt; this is the user override.
+touchHLE_options.txt
+touchHLE_music_library.txt
+touchHLE_music_library_cache.tsv
+touchHLE_wallpaper.*
+
+# Sandboxed app data (save games etc). Personal + can be huge.
+/touchHLE_sandbox
+
+# ----------------------------------------------------------------------
+# 4. Bundled apps and personal media (copyright + privacy)
+# ----------------------------------------------------------------------
+# Anything dropped here by the user -- IPAs are almost always
+# copyright-encumbered and should not be redistributed via git.
+/touchHLE_apps
+/apps
+*.ipa
+# But do keep the explainer README that comes with the empty
+# touchHLE_apps/ directory.
+!/touchHLE_apps/README.txt
+
+# Android wrapper auto-launch IPA asset (same .ipa as above; lives
+# inside the flavor's assets so Gradle picks it up). Keep the rest of
+# the flavor (drawables, layouts) tracked.
+android/app/src/songsummoner/assets/song_summoner.ipa
+
+# Per-user music library a developer adds for testing. The three NCS
+# tracks already in sample_music/ ship with the distro (NCS allows
+# free redistribution with credit), so they stay tracked -- only
+# additional dropped files (which you don't redistribute) are
+# excluded by uncommenting the lines below.
+# /sample_music/*.mp3
+# /sample_music/*.m4a
+# /sample_music/*.wav
+# /sample_music/*.flac
+# /sample_music/*.ogg
+
+# ----------------------------------------------------------------------
+# 5. Release artifacts
+# ----------------------------------------------------------------------
+# Distro folders are populated by the packaging step; ship them via
+# GitHub Releases, not git. Keep their README/source if you want to
+# track the packaging script -- but the populated copies are bulky and
+# get re-generated on every refresh.
+/dist
+/dist_windows
+/dist_wrapper
+
+# Zipped distros at repo root.
+SongSummoner_Windows.zip
+SongSummoner_Android.zip
+*.zip
+
+# ----------------------------------------------------------------------
+# 6. RE / inspect outputs
+# ----------------------------------------------------------------------
+# Unpacked .ipa contents are copyrighted Square Enix material; only the
+# RE scripts (.py / .md write-ups) are safe to commit.
+/inspect/Payload
+/inspect/iTunesArtwork
+/inspect/Lning@iphonecake.com
