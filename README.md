@@ -1,147 +1,224 @@
-# touchHLE: high-level emulator for iPhone OS apps
+# Song Summoner: The Unsung Heroes Encore — touchHLE port notes
 
-**touchHLE** is a high-level emulator for iPhone OS apps. It runs on modern desktop operating systems and Android, and is written in Rust.
+A fork of [touchHLE](https://github.com/touchHLE/touchHLE) wired up to run
+*Song Summoner: The Unsung Heroes Encore* on Windows against the user's
+local music library. Everything below is about that game specifically —
+the upstream emulator already runs other titles.
 
-touchHLE's high-level emulation (HLE) approach differs from low-level emulation (LLE) in that it does not directly simulate the iPhone/iPod touch hardware. Instead of running iPhone OS inside emulation, touchHLE _itself_ takes the place of iPhone OS and provides its own implementations of the system frameworks (Foundation, UIKit, OpenGL ES, OpenAL, etc). The only code the [emulated CPU](https://github.com/merryhime/dynarmic) executes is the app binary and [a handful of libraries](touchHLE_dylibs/).
+This document is the project-level overview. For a deeper RE-oriented
+write-up of the picker work see
+[`dev-docs/song-summoner-picker.md`](dev-docs/song-summoner-picker.md).
 
-The goal of this project is to run games from the early days of iOS:
+## What was tackled
 
-* Currently: iPhone and iPod touch apps for iPhone OS 2.x and iPhone OS 3.0.
-* Longer term: iPhone OS 3.1, iPad apps (iPhone OS 3.2), iOS 4.x, …
-* [Never](https://github.com/touchHLE/touchHLE/issues/181#issuecomment-1777098259): 64-bit iOS.
+The game's whole loop is *Pick a song → confirm → "Create Trooper" → play*.
+On a real iPhone it goes through Apple's `MPMediaPickerController` against
+the iPod library. Inside touchHLE there is no real iPod library, no real
+`MPMediaPickerController`, and the game's 5-row picker is hard-wired to a
+built-in 5-song fixture. The goal was to make the picker actually browse
+the user's local music and have the rest of the iPod-flow downstream
+of that (audio preview, confirmation panel, "Create Trooper") behave as
+if the user had picked a song on an iPhone.
 
-**This does not mean that all apps for these OS versions work.** The vast majority of iPhone OS 2.x and iPhone OS 3.x apps do not currently work in touchHLE, and the ones that do work are generally games (support for other apps isn't a priority: it's more complex and less fun). This improves gradually over time with contributions from various developers. The [touchHLE app compatibility database](https://appdb.touchhle.org/) tracks which apps work in touchHLE; it is a crowdsourced effort to which anyone can contribute. **We don't take requests, so please do not ask us to support your favourite game.**
+In scope:
 
-If you're curious about the history and motivation behind the project, you might want to read [the original announcement](https://hikari.noyu.me/blog/2023-02-06-touchhle-anouncement-thread-tech-games-me-and-passion-projects.html). For an introduction to some of the technical details, check out [_touchHLE in depth_](https://hikari.noyu.me/blog/2023-04-13-touchhle-in-depth-1-function-calls.html).
+- Wire a full 1317-row picker (sourced from the host music library)
+  in place of the 5-row default, without breaking the game's `IPDSongsTab`
+  delegate contract.
+- Get the right `persistentID` to the game's pick handler on each tap.
+- Play the actual user-selected MP3 as the preview when confirming.
+- Make the **No** and **Back** and **Create Trooper** buttons behave.
+- Get the panel to **re-build** when the user picks another song after
+  tapping No, instead of being stuck on the first pick's state.
 
-**Check out the website for downloads, FAQ, social media, and more:**<br>👉 <https://touchhle.org/> 👈
+## Heads-up: antivirus false positives on Windows
 
-## Important disclaimer
+`touchHLE.exe` is unsigned and ships a JIT (dynarmic) that allocates
+executable memory at runtime to translate ARM code — a pattern that
+trips heuristic scanners. **Avast, AVG, Bitdefender, occasionally
+Windows Defender, and SmartScreen** may flag it or move it to
+quarantine on first launch. It's a false positive.
 
-This project is not affiliated with or endorsed by Apple Inc in any way. iPhone, iOS, iPod, iPod touch and iPad are trademarks of Apple Inc in the United States and other countries.
+Workarounds: restore the file from your AV's quarantine and add an
+exception for the folder you unzipped into, or build touchHLE from
+source on your own machine (the locally-built `.exe` generally
+won't trip these heuristics). The end-user-facing details are in
+[`dist_windows/README.txt`](dist_windows/README.txt).
 
-Only use touchHLE to emulate software you have obtained legally.
+The Android wrapper APK is signed (with the standard debug key)
+and is not affected.
 
-## Platform support
+## What works
 
-* Officially supported: x64 Windows, x64 macOS and AArch64 Android.
-  * These are the platforms with binary releases.
-  * If you're an Apple Silicon Mac user, the x64 build reportedly works in Rosetta.
-* Probably works, but you must build it yourself: AArch64 macOS, x64 Linux, AArch64 Linux.
-* Never?: other architectures.
+| Layer                                               | State |
+| --------------------------------------------------- | ----- |
+| App bundle / ARM slice loads                        | OK |
+| GLES fallback rendering                             | OK |
+| UI renders correctly                                | OK |
+| Music library cache loads (1317 host songs scanned) | OK |
+| `MPMediaQuery + songsQuery / albumsQuery / ...`     | OK |
+| Promoted 1317-row picker visible in iPod app        | OK |
+| Per-row dispatch — game receives the picked PID     | OK |
+| Audio preview plays the actual host file            | OK |
+| **No** button → cancel + remount picker             | OK |
+| **Back** button → cancel + dismiss picker           | OK |
+| **Create Trooper** → game advances with right PID   | OK |
+| Game reaches Create Trooper / battle flow           | OK |
 
-Input methods:
+Verified end-to-end data contract on each pick:
 
-- For simulated touch input, there are four options:
-  - Mouse/trackpad input (tap/hold/drag by pressing the left mouse button)
-  - Virtual cursor using a game controller (move the cursor with the right analog stick, and tap/hold/drag by pressing the stick or the right shoulder button)
-  - Mapping of game controller buttons or the left analog stick to specific on-screen locations (see the descriptions of `--button-to-touch=`, `--dpad-to-touch=` and `--stick-to-touch=` in `OPTIONS_HELP.txt`)
-  - Real touch input, if you're on a device that has a touch screen
-- For simulated accelerometer input, there are three options:
-  - Tilt control simulation using the left analog stick of a game controller
-  - Tilt control simulation using a mouse (hold down the right mouse button)
-  - Real accelerometer input, if you are using a phone, tablet or some other device with a built-in accelerometer (TODO: support game controllers with accelerometers)
+1. UI row N (e.g. row 5) →
+2. `persistentID` `AB7BF3A3...` (game logs `SONG : ... PID : ...`) →
+3. touchHLE resolves to `03 HATSUKOI EVOLUTION.mp3` →
+4. Audio path actually plays that file.
 
-## Development status
+All three sides (UI, PID, file) match. The MediaPlayer hook layer is
+sound — confirmed by tracing every `MPMediaItem valueForProperty:` call
+through a session.
 
-This project has been in development since December 2022. This was originally [hikari\_no\_yume](https://hikari.noyu.me/)'s full-time passion project. Since its release in February 2023, a number of other volunteers have also [contributed in their free time](https://github.com/touchHLE/touchHLE/graphs/contributors), and this is no longer a single-person project. There's only been a handful of releases so far and no promises can be made about the future. Please be patient.
+## What still does not fully work
 
-In general, the supported functionality is defined by the supported apps: most contributors are interested in getting a particular game working, and contribute support for whichever missing features are needed for that game. Consequently, the completeness varies a lot between APIs, e.g. UIKit is easily the most hacky and incomplete of the large frameworks that have been implemented, because most games don't use very much of its functionality, whereas the OpenGL ES and OpenAL implementations are probably complete enough to cover a large number of early apps, because games make heavy use of these.
+### Cosmetic: confirmation-panel title stacking on Pick 2+
 
-# Usage
+After picking → tapping **No** → picking again, the *previous* pick's
+title text remains visible underneath the new pick's title text. Other
+panel elements (artist name, artwork thumbnail, dialog text) render
+correctly; only the **title sprite** stacks.
 
-First obtain touchHLE, either a [binary release](https://github.com/touchHLE/touchHLE/releases) or by building it yourself (see the next section).
+The functional flow is **not** affected. Even with the visible stack,
+`Create Trooper` advances with the **correct** `iPodMusicID` (the
+latest pick's PID).
 
-You'll then need an app that you can run. The [app compatibility database](https://appdb.touchhle.org/) is a good guide for which versions of which apps are known to work, but bear in mind that it may contain outdated or inaccurate information. Note that the app binary must be decrypted to be usable.
+#### Why this happens (current understanding)
 
-There's a few ways you can run an app in touchHLE.
+- The confirmation panel is rendered through **custom OpenGL sprites**
+  by the scene render function at `0x17800`, not through UIKit
+  `UILabel`s. (Confirmed: no `UILabel` in `keyWindow`'s subtree has a
+  panel-region frame; the game-rendered title is invisible to UIKit
+  traversal.)
+- On Pick 2+, the game does **not** re-query
+  `MPMediaItem.valueForProperty:'title'` — title comes from a cache the
+  game built at boot, keyed by PID. So we cannot fix the panel text by
+  changing what we return from the media-player hooks.
+- The OpenGL sprite that holds the old title sits in a sprite list whose
+  address we have not located. It is **not** in the 88-byte scene struct
+  at entry-5 (`+0x00..+0x57` all confirmed not to hold sprite refs after
+  the panel is parked), and **not** in the global state struct at
+  `0xc7890`.
+- Each pick leaks ~2 GL textures (the title and artist text textures —
+  confirmed via `glGenTextures`/`glDeleteTextures` tracking). Freeing
+  those textures directly makes the still-referencing sprites draw
+  **VRAM garbage**, which is worse.
 
-## Special Android notes
+#### Workaround
 
-Windows, Mac and Linux users can skip this section.
+Tap **Back** to leave the iPod menu, then re-enter it. The game's
+**natural** Back→re-enter transition runs the scene's destructor path
+(burst of `glDeleteTextures`, scene table entry-5 reassigned to a fresh
+struct, sprite list cleared as part of teardown). The next pick starts
+clean.
 
-On Android, only the graphical user interface (app picker) is available. Therefore, you must put your “.ipa” files or “.app” bundles inside the “touchHLE\_apps” directory. Note that you can only do that once you have run touchHLE at least once.
+## What we tried that did not stick
 
-File management can be tricky on Android due to [restrictions introduced by Google in newer Android versions](https://developer.android.com/about/versions/11/privacy/storage#scoped-storage). One of these methods may work:
+A non-exhaustive list of approaches investigated and reverted, with the
+reason each was rejected. Helpful in case you have a new idea — checking
+this list first will save you redoing experiments we already failed.
 
-* If you tap the “File manager” button in touchHLE, this should open some sort of file manager. You might also be able to find touchHLE in your device's file manager app (often called “Files”, or sometimes “Downloads”), alongside cloud storage services. There are some limitations on what kinds of operations are possible. The files in this location are stored on your device. Warning: on some devices, the “File manager” button _will_ open a file manager, but it will crash when actually doing file operations (this is probably a bug in Android, we have not been able to debug it). If this happens to you, clear that file manager from your recent apps list and try to navigate to your device's file manager app directly instead, rather than via the touchHLE UI.
-* If you have an older version of Android, you may be able to directly access touchHLE's files by browsing to `/sdcard/Android/data/org.touchhle.android/files/touchHLE_apps`. Note that the `/sdcard` directory is usually not on the SD card.
-* You may be able to use ADB. If you're unfamiliar with ADB, try using <https://yume-chan.github.io/ya-webadb/> (in Google Chrome or another browser with WebUSB) with your device connected over USB. touchHLE's files can be found in “sdcard” > “Android” > “data” > “org.touchhle.android” > “files” > “touchHLE\_apps”.
+### Sprite-list / scene-struct manipulation
 
-## Graphical user interface
+| Attempt | Result |
+| --- | --- |
+| Write `0xFFFFFFFF` to `scene+0x10..+0x3c` (matching in-render cleanup loop's value) | Render code still treated `-1` slots as referencing visible sprites |
+| Write `0` to `scene+0x10..+0x3c` (matching natural teardown's resulting values) | Slots were **already** zero after panel parked — those aren't where sprite refs live |
+| Dump full `scene+0x00..+0x57` (28 bytes past the usual window) during panel-build | No pointer-looking values appeared — sprite list lives elsewhere |
+| Dump `[0xc7890]+0x00..+0x3c` (animation singleton) across picks | Unchanged after `0xa800(0)` reset; not where sprite refs live |
 
-touchHLE has a built-in app picker. If you put your `.ipa` files and `.app` bundles in the `touchHLE_apps` directory, they will show up in the app picker when you run touchHLE.
+### Texture-pool / GL-handle manipulation
 
-To configure the options, you can edit the `touchHLE_options.txt` file. To get a list of options, look in the `OPTIONS_HELP.txt` file.
+| Attempt | Result |
+| --- | --- |
+| Call `0xd2c8` global texture sweep on No-tap | Wiped picker-table textures → blank white rectangles |
+| Call `0xc708` (per-index destroy) on the iPod scene's entry | Either no-op or destroyed wrong slot — sprites stayed |
+| `glDeleteTextures` the leaked title/artist IDs directly from host | Sprites that still referenced them drew VRAM garbage |
+| Track GL handles per "generation" and only delete the previous gen | Same VRAM-garbage outcome — sprite list still references the freed handle |
 
-## Command-line user interface
+### Scene state-machine manipulation
 
-**This section does not apply on Android.**
+| Attempt | Result |
+| --- | --- |
+| Reset only `scene+0x0c=0` (counter) on No-tap | Counter restarted but state stayed `0x11` (parked) → panel-build keyframe never fired → no `+songsQuery` for Pick 2 |
+| `force_panel_rebuild_predicate`: write `scene+0x00=0xe`, `+0x08=3`, `+0x0c=0` | Pick-1-style behaviour, sometimes worked for one extra pick, didn't survive multiple cycles |
+| `kick_scene_counter_for_rebuild`: write `scene+0x00=0x6` (loading), `+0x08+=2`, `+0x0c=0` — mimics the natural Back+re-enter delta | **Did** make `+songsQuery FIRED` fire reliably on Pick 2+ with the new PID. **But** state 0x6 made the game instantiate a *second* `iPodView2` on top of the existing one — two stacked iPodView2s in the window |
+| Same kick + recursively remove all `iPodView2` instances from the window via UIKit traversal before the kick | Not enough — `iPodView2` total instance size is 21 bytes with 1 ivar (`isCanceled`); the title sprites are not its property, they're in C++ rendering state held elsewhere |
 
-You can see the command-line usage by passing the `--help` flag.
+### Scene/iPodView destruction
 
-If you're a Windows user and unfamiliar with the command line, these instructions may help you get started:
+| Attempt | Result |
+| --- | --- |
+| Allocate a fresh scene struct via the constructor at `0x16602`, write it into scene table entry 5 | Old scene leaked, double-render of all sprites, much worse than stacking |
+| Find the scene destructor function | Function exists somewhere in the `0xc800..0xcb50` cluster (~13 small helpers around the scene-table) but is reached only via computed addressing (`base + idx*stride + offset`), not via direct `BL`. Static search has not surfaced it. |
+| Look for an iPodView2 destructor / dealloc override | iPodView2 has only one ivar (`isCanceled`) and no custom dealloc surfaced — destruction happens at the C++ rendering layer, not at the Obj-C class level |
 
-1. Move the `.ipa` file or `.app` bundle to the same folder as `touchHLE.exe`.
-2. Hold the Shift key and right-click on the empty space in the folder window.
-3. Click “Open with PowerShell”.
-4. Type `.\touchHLE.exe "YourAppNameHere.ipa"` (or `.app` as appropriate) and press Enter. If you want to specify options, add a space after the app name (outside the quotes) and then type the options, separated by spaces.
+### Obj-C / view-hierarchy approaches
 
-## Local multiplayer support
+| Attempt | Result |
+| --- | --- |
+| `find_view_by_class("iPodView2")` + `removeFromSuperview` | Removes the UIView from the hierarchy but the C++ rendering layer keeps drawing because the sprite list is not owned by the UIView |
+| Dump `ViewManager` / `MainView` ivars via Mach-O Obj-C metadata | Located `ViewManager` ivar layout (`+0x5c=ipodview`, `+0x60=loadView`, ...) but the ivars are *pointers to* the view objects; the sprite list itself is owned in C++ state below the Obj-C layer |
+| Set up panel-views snapshot at `+songsQuery` time | Useful for diagnosis (showed labels with `parent=UITableViewCell` only — confirms the title is **not** a UIKit label) — did not lead to a fix |
 
-touchHLE provides limited support for local multiplayer via Wi-Fi in some games. At the moment of writing it is supported in Asphalt 4 and N.O.V.A.
+### Why we stopped
 
-Real iOS devices could also join/host games!
+The remaining fix path is: locate the C++ sprite list that the scene
+render at `0x17800` iterates over each frame, then find the function
+that mutates it on the natural Back transition, then call that function
+on the No path. That's ~5–10 hours of careful RE inside the
+`0xc800..0xcb50` cluster with no guarantee. The game is otherwise fully
+playable — the visible stack is annoying but doesn't break gameplay or
+mis-trooper anything — so this is documented as a known limitation
+rather than a blocker.
 
-**Usage:**
-1. Install touchHLE on 2+ devices connected to the same Wi-Fi network.
-2. **Important:** Ensure touchHLE is whitelisted in your OS firewall/network settings.
-3. Enable "Network access" in Quick options or via `--allow-network-access`.
-4. Start/join multiplayer in the game.
+## Files touched (relative to repo root)
 
-**FAQs:**
-* **Tunneling over Internet/VPN:** Not officially supported, but might work.
-* **Bluetooth:** Not supported.
+- `src/frameworks/uikit/ui_view/ui_table_view.rs` — promoted picker,
+  picker-swap dispatch, scene observer, `invoke_ipodview_reset`,
+  `force_panel_rebuild_predicate`, GL texture tracker.
+- `src/frameworks/uikit/ui_touch.rs` — button-area touch classifier;
+  No / Back / Create Trooper routing.
+- `src/frameworks/foundation/ns_run_loop.rs` — per-tick scene observer
+  hook + deferred picker-swap drain.
+- `src/frameworks/media_player/media_query.rs` — `+songsQuery`,
+  `+albumsQuery`, etc.; collections-filtering for picker swap;
+  state snapshots on query.
+- `src/frameworks/media_player/media_item.rs` — `MPMediaItem` host
+  object, `valueForProperty:` hook, cache-by-song-index identity.
+- `src/frameworks/media_player/music_library.rs` — host song lookup,
+  PID staging, audio preview path.
+- `src/frameworks/media_player/media_picker_controller.rs` — delegate
+  capture stub (unused since game uses its own
+  `IPDMediaPickerController`).
+- `src/frameworks/opengles/gles_guest.rs` — `glGenTextures` /
+  `glDeleteTextures` tracking hooks.
+- `src/frameworks/openal.rs` — `alcDestroyContext` LR-logging hook
+  (used during scene-destructor RE).
+- `inspect/` — RE scripts: see
+  [`dev-docs/song-summoner-picker.md`](dev-docs/song-summoner-picker.md)
+  for the full list.
 
-**Known issues:**
-* On macOS you may need to launch touchHLE from terminal as otherwise OS will block network connections.
+## Key binary addresses
 
-## Other stuff
-
-Any data saved by the app (e.g. **saved games**) are stored in the `touchHLE_sandbox` folder.
-
-If the emulator crashes almost immediately while running a **known-working** version of a game, please check whether you have any overlays turned on like the Steam overlay, Discord overlay, RivaTuner Statistics Server, etc. Sadly, as useful as these tools are, they work by injecting themselves into other apps or games and don't always clean up after themselves, so they can break touchHLE… it's not our fault. 😢 Currently only RivaTuner Statistics Server is known to be a problem. If you find another overlay that doesn't work, please tell us about it.
-
-# Building and contributing
-
-See the `CONTRIBUTING.md` file in the git repo if you want to contribute. If you just want build touchHLE, look at `dev-docs/building.md`.
-
-# License
-
-touchHLE © 2023–2026 touchHLE project contributors.
-
-The source code of touchHLE itself (not its dependencies) is licensed under the Mozilla Public License, version 2.0.
-
-Due to license compatibility concerns, binaries are under the GNU General Public License version 3 or later.
-
-For a best effort listing of all licenses of dependencies, build touchHLE and pass the `--copyright` flag when running it, or click the “Copyright info” button in the app picker.
-
-Please note that different licensing terms apply to the bundled dynamic libraries (in `touchHLE_dylibs/`) and fonts (in `touchHLE_fonts/`). Please consult the respective directories for more information.
-
-# Thanks
-
-We stand on the shoulders of giants. Thank you to:
-
-* Everyone who has contributed to the project or supported any of its contributors financially.
-* The authors of and contributors to the many libraries used by this project: [dynarmic](https://github.com/merryhime/dynarmic), [rust-macho](https://github.com/flier/rust-macho), [SDL](https://libsdl.org/), [rust-sdl2](https://github.com/Rust-SDL2/rust-sdl2), [stb\_image](https://github.com/nothings/stb), Imagination Technologies' [PVRTC decompressor](https://github.com/powervr-graphics/Native_SDK/blob/master/framework/PVRCore/texture/PVRTDecompress.cpp), [openal-soft](https://github.com/kcat/openal-soft), [hound](https://github.com/ruuda/hound), [Symphonia](https://github.com/pdeljanov/Symphonia), [RustType](https://gitlab.redox-os.org/redox-os/rusttype), [the Liberation fonts](https://github.com/liberationfonts/liberation-fonts), [the Noto CJK fonts](https://github.com/googlefonts/noto-cjk), [rust-plist](https://github.com/ebarnard/rust-plist), [nibarchive](https://github.com/michaelwright235/nibarchive), [quick-xml](https://github.com/tafia/quick-xml), [gl-rs](https://github.com/brendanzab/gl-rs), [cargo-license](https://github.com/onur/cargo-license), [cc-rs](https://github.com/rust-lang/cc-rs), [cmake-rs](https://github.com/rust-lang/cmake-rs), [cargo-ndk](https://github.com/bbqsrc/cargo-ndk), [cargo-ndk-android-gradle](https://github.com/willir/cargo-ndk-android-gradle), [md-5 and sha1](https://github.com/RustCrypto/hashes), [encoding_rs](https://github.com/hsivonen/encoding_rs), [corosensei](https://github.com/Amanieu/corosensei), [uuid](https://github.com/uuid-rs/uuid) and the Rust standard library.
-* The Skyline emulator project (RIP), for [writing the tedious boilerplate needed to replace file management on newer Android versions](https://github.com/skyline-emu/skyline/blob/dc20a615275f66bee20a4fd851ef0231daca4f14/app/src/main/java/emu/skyline/provider/DocumentsProvider.kt).
-* The [Rust project](https://www.rust-lang.org/) generally.
-* The various people out there who've documented the iPhone OS platform, officially or otherwise. Much of this documentation is linked to within this codebase!
-* The iOS hacking/jailbreaking community.
-* The Free Software Foundation, for making libgcc and libstdc++ copyleft and therefore saving this project from ABI hell.
-* The National Security Agency of the United States of America, for [Ghidra](https://ghidra-sre.org/).
-* [GerritForge](http://www.gerritforge.com/) for providing free Gerrit hosting to the general public, including us.
-* The many contributors to [Gerrit](https://www.gerritcodereview.com/).
-* Many friends who took an interest in the project and gave suggestions and encouragement.
-* Developers of early iPhone OS apps. What treasures you created!
-* Apple, and NeXT before them, for creating such fantastic platforms.
+| Addr        | What |
+| ----------- | ---- |
+| `0x322c`    | `MainLoop_Set_iPodState(int)` |
+| `0x3244`    | `MainLoop_Set_iPodCancel(int)` |
+| `0x325c`    | `MainLoop_Set_iPodMusicID(uint32 lo, uint32 hi)` |
+| `0xa800`    | iPodView2 animation reset (arg=0 = full reset) |
+| `0xc48d0`   | MainLoop state struct base |
+| `0xc7890`   | Animation / render-state singleton |
+| `0xc9f4`    | `get_scene_obj()` |
+| `0x16602`   | Scene constructor (mallocs 88 bytes, init state=9) |
+| `0x17800`   | Scene render function (frame-counter keyframe dispatch) |
+| `0x1134f0`  | Scene table base (16 entries × 0x1c bytes; scene_ptr at +0x18) |
+| `0x1136b0`  | Current scene index (uint32) |
+| `0x60150`   | `iPodView2.mediaPickerDidCancel:` |
+| `0x60170`   | `iPodView2.mediaPicker:didPickMediaNumber:` |
