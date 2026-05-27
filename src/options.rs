@@ -48,6 +48,14 @@ pub struct Options {
     pub dpad_to_touch: Option<(f32, f32, f32, f32)>,
     pub stick_to_touch: Option<(f32, f32, f32, f32)>,
     pub stabilize_virtual_cursor: Option<(f32, f32)>,
+    /// If set, switches the virtual cursor from "absolute" mode (stick
+    /// position == on-screen cursor position) to "mouse-style" mode: the
+    /// stick deflection acts as a velocity (pixels per second at full
+    /// deflection), the cursor keeps its position when the stick is
+    /// released, and the cursor auto-hides after a short idle timeout.
+    /// Useful for menu-driven games where the player wants to release the
+    /// stick mid-decision without losing their cursor place.
+    pub mouse_style_cursor: Option<f32>,
     /// If true, swap the role of the left and right analog sticks: the
     /// **left** stick drives the virtual cursor and the **right** stick
     /// drives the `--stick-to-touch` drag region. Useful for genres
@@ -89,6 +97,7 @@ impl Default for Options {
             stick_to_touch: None,
             swap_sticks: false,
             stabilize_virtual_cursor: None,
+            mouse_style_cursor: None,
             gles1_implementation: None,
             direct_memory_access: true,
             gdb_listen_addrs: None,
@@ -216,6 +225,13 @@ impl Options {
                     "Invalid sticky radius for --stabilize-virtual-cursor=".to_string()
                 })?;
             self.stabilize_virtual_cursor = Some((smoothing_strength, sticky_radius));
+        } else if let Some(value) = arg.strip_prefix("--mouse-style-cursor=") {
+            let speed: f32 = value
+                .parse()
+                .ok()
+                .and_then(|s: f32| if s.is_finite() && s > 0.0 { Some(s) } else { None })
+                .ok_or_else(|| "Invalid speed for --mouse-style-cursor=".to_string())?;
+            self.mouse_style_cursor = Some(speed);
         } else if let Some(value) = arg.strip_prefix("--gles1=") {
             self.gles1_implementation = Some(
                 GLESImplementation::from_short_name(value)

@@ -185,6 +185,20 @@ Game controller options:
         such that sharp movements take about half a second to complete, while
         movements within a 10px radius will be completely ignored.
 
+    --mouse-style-cursor=...
+        Switch the virtual cursor from absolute-position mode (the cursor's
+        on-screen position mirrors the stick deflection, and it snaps back to
+        the centre when the stick is released) to a mouse-style mode where
+        the stick acts as a velocity instead. The cursor moves at up to the
+        configured speed in pixels-per-second at full stick deflection,
+        keeps its on-screen position when the stick is released, and auto-
+        hides after a few seconds of inactivity.
+
+        For example, --mouse-style-cursor=800 lets the cursor cross an
+        ~800px screen in one second of full-deflection stick input. Best
+        suited to menu-driven games where the player needs to release the
+        stick to think without losing their place.
+
     --swap-sticks
         Swap the analog sticks' assignments. By default the RIGHT stick drives
         the virtual cursor and the LEFT stick drives --stick-to-touch (or the

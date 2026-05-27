@@ -552,6 +552,10 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     let viewport = env.window.as_mut().unwrap().viewport();
     let rotation_matrix = env.window.as_mut().unwrap().rotation_matrix();
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
+    // Clone-the-Arc snapshot of the cursor sprites so we can keep using
+    // them after env.window gets re-borrowed mutably below for the GL
+    // context. The Arc clone is cheap; no pixel data is copied.
+    let cursor_sprites = env.window.as_mut().unwrap().cursor_sprites.clone();
 
     let gles_ctx = super::get_thread_context(
         &mut env.framework_state.opengles,
@@ -679,7 +683,13 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     );
 
     // Draw the quad
-    present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
+    present_frame(
+        gles,
+        viewport,
+        rotation_matrix,
+        virtual_cursor_visible_at,
+        &cursor_sprites,
+    );
 
     // Clean up the texture
     gles.DeleteTextures(1, &texture);

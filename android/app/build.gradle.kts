@@ -58,10 +58,13 @@ android {
         // Default-flavor BuildConfig fields — overridden in the
         // `songsummoner` flavor so the same MainActivity code can branch
         // on whether it's the generic emulator build or the standalone
-        // game-wrapper build.
+        // game-wrapper build. In wrapper mode the IPA is NOT bundled in
+        // the APK; it lives in WRAPPER_USER_DATA_DIR on the device's
+        // public storage, which is also where touchHLE's user data is
+        // redirected to live.
         buildConfigField("boolean", "WRAPPER_AUTO_LAUNCH", "false")
-        buildConfigField("String",  "WRAPPER_IPA_ASSET",   "\"\"")
         buildConfigField("String",  "WRAPPER_IPA_FILENAME", "\"\"")
+        buildConfigField("String",  "WRAPPER_USER_DATA_DIR", "\"\"")
 
         minSdk = 21 // first version with AArch64
         targetSdk = 31
@@ -90,9 +93,12 @@ android {
     }
     // Product flavors let us ship two artifacts from one codebase:
     //   - `touchhle`     -- the generic emulator with an app picker
-    //   - `songsummoner` -- a standalone wrapper that bundles the
-    //                       Song Summoner IPA in assets/ and skips the
-    //                       picker, jumping straight into the game.
+    //   - `songsummoner` -- a standalone wrapper that auto-launches the
+    //                       Song Summoner IPA from /sdcard/SongSummoner/.
+    //                       The IPA is NOT bundled in the APK; the user
+    //                       drops it into that folder themselves. All
+    //                       touchHLE user data (options, sandbox, music
+    //                       library, log) also lives in that folder.
     // The Java side branches on BuildConfig.WRAPPER_AUTO_LAUNCH.
     flavorDimensions += "distribution"
     productFlavors {
@@ -110,19 +116,18 @@ android {
             buildConfigField("String",  "APP_NAME", "\"Song Summoner\"")
             // Wrapper behaviour switches.
             buildConfigField("boolean", "WRAPPER_AUTO_LAUNCH", "true")
-            buildConfigField("String",  "WRAPPER_IPA_ASSET",   "\"song_summoner.ipa\"")
-            // Filename used when copying to internal storage; the .ipa
-            // extension matters because touchHLE's bundle loader sniffs it.
+            // Filename the wrapper expects under WRAPPER_USER_DATA_DIR.
+            // The .ipa extension matters because touchHLE's bundle
+            // loader sniffs it.
             buildConfigField("String",  "WRAPPER_IPA_FILENAME",
                 "\"Song Summoner The Unsung Heroes Encore.ipa\"")
+            // Public-storage folder that holds both the IPA and all
+            // touchHLE user data for this flavor. MainActivity sets the
+            // TOUCHHLE_USER_DATA_BASE_PATH env var to this before SDL
+            // starts the native thread, and paths.rs honours it.
+            buildConfigField("String",  "WRAPPER_USER_DATA_DIR",
+                "\"/sdcard/SongSummoner\"")
         }
-    }
-
-    // The IPA is already a compressed zip; AAPT compressing it again
-    // would double-process ~260 MB for no gain and slow down install /
-    // first-launch extraction. Mark it noCompress.
-    androidResources {
-        noCompress.add("ipa")
     }
 
     buildTypes {
@@ -153,8 +158,33 @@ android {
     sourceSets {
         getByName("main") {
             java.srcDir("${rootDir.parentFile}/vendor/SDL/android-project/app/src/main/java")
+            // Ship the virtual-cursor sprite PNGs that the user drops at
+            // <project-root>/res/cursor_*.png. The copy task below stages
+            // them under build/generated/cursor_assets/res/ so AAPT packs
+            // them at assets/res/cursor_*.png in the APK, where the Rust
+            // side's ResourceFile loader will find them.
+            assets.srcDir(
+                layout.buildDirectory.dir("generated/cursor_assets")
+            )
         }
     }
+
+    // Copy the cursor sprite PNGs from the project root into the generated
+    // assets directory the sourceSets entry above points at. Idempotent and
+    // tolerant of missing files (the build still succeeds with no sprites;
+    // the renderer falls back to the legacy black-dot cursor for whichever
+    // states have no PNG).
+    val copyCursorSprites = tasks.register<Copy>("copyCursorSprites") {
+        from("${rootDir.parentFile}/res") {
+            // Match both the README's underscore aliases and the
+            // capitalised spaced names the user actually saves them as.
+            include("cursor_*.png", "Cursor *.png")
+            into("res")
+        }
+        into(layout.buildDirectory.dir("generated/cursor_assets"))
+    }
+    tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }
+        .configureEach { dependsOn(copyCursorSprites) }
 
     if (!project.hasProperty("EXCLUDE_NATIVE_LIBS")) {
         sourceSets {

@@ -18,7 +18,9 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.DocumentsContract;
 import android.provider.Settings;
+import android.system.Os;
 import android.util.Log;
+import android.widget.Toast;
 
 import org.libsdl.app.SDLActivity;
 import org.touchhle.android.BuildConfig;
@@ -35,7 +37,9 @@ import java.io.InputStream;
  * touchHLE's Rust side can't do itself:
  *
  *   1. A one-time, deferred prompt for MANAGE_EXTERNAL_STORAGE so user data
- *      can live at /sdcard/touchHLE/ instead of the Android/data sandbox.
+ *      can live in a public folder (default /sdcard/touchHLE/, or
+ *      /sdcard/SongSummoner/ in the wrapper flavor) instead of the
+ *      Android/data sandbox.
  *   2. A one-time SAF (Storage Access Framework) folder picker so the user
  *      can choose where their music library lives. The picked path is
  *      converted to a real /storage path and written to
@@ -53,11 +57,26 @@ public class MainActivity extends SDLActivity {
     private static final String PREFS_NAME = "touchHLE";
     private static final String PREF_REQUESTED_ALL_FILES = "requested_all_files_access";
 
-    /** Path where music_library.rs reads the chosen music folder from. */
-    private static final String MUSIC_LIBRARY_FILE =
-        "/sdcard/touchHLE/touchHLE_music_library.txt";
+    /** Default public user-data folder for the generic touchhle flavor.
+     *  The wrapper flavor overrides this via BuildConfig.WRAPPER_USER_DATA_DIR. */
+    private static final String DEFAULT_USER_DATA_DIR = "/sdcard/touchHLE";
+
+    /** Env var read by paths.rs::resolve_android_user_data_path to override
+     *  the default /sdcard/touchHLE location. Set from {@link #onCreate}
+     *  before super so the Rust side picks it up on first lookup. */
+    private static final String ENV_USER_DATA_BASE_PATH = "TOUCHHLE_USER_DATA_BASE_PATH";
 
     private static final int REQ_PICK_MUSIC_FOLDER = 1001;
+
+    /** Resolved public user-data folder for this flavor. Cached in onCreate
+     *  so the music-library path, album-placeholder targets and the
+     *  TOUCHHLE_USER_DATA_BASE_PATH env var all agree. */
+    private String userDataDir = DEFAULT_USER_DATA_DIR;
+
+    /** Path where music_library.rs reads the chosen music folder from.
+     *  Resolved from {@link #userDataDir} in onCreate. */
+    private String musicLibraryFile =
+        DEFAULT_USER_DATA_DIR + "/touchHLE_music_library.txt";
 
     /**
      * Delay before firing any setup prompt. Must be long enough for
@@ -72,22 +91,49 @@ public class MainActivity extends SDLActivity {
     private static final long SETUP_PROMPT_DELAY_MS = 1000;
 
     /**
-     * Absolute path to the bundled IPA after it's been unpacked into the
-     * app's internal-storage files dir. Computed once in {@link #onCreate}
-     * (before super, so {@link #getArguments} can return it as argv[1] when
-     * SDL fires up the native thread). Null in the non-wrapper flavor.
+     * Absolute path to the wrapper IPA on public storage. Resolved once
+     * in {@link #onCreate} (before super, so {@link #getArguments} can
+     * return it as argv[1] when SDL fires up the native thread). Null in
+     * the non-wrapper flavor or when the file is missing.
      */
     private String wrapperIpaPath = null;
 
+    /**
+     * Set to a user-facing reason ("IPA not found at ...") when the
+     * wrapper flavor can't resolve its IPA. Shown as a Toast once
+     * super.onCreate has set up the window. Null when everything's fine.
+     */
+    private String wrapperMissingIpaReason = null;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        // CRITICAL: unpack the bundled IPA BEFORE super.onCreate(). SDL's
+        // CRITICAL: do wrapper setup BEFORE super.onCreate(). SDL's
         // SDLActivity.onCreate spins up the native thread which calls
-        // getArguments() shortly after; if the IPA isn't on disk yet,
-        // touchHLE's main() will see no bundle_path and fall back to the
-        // app-picker, defeating the wrapper.
-        if (BuildConfig.WRAPPER_AUTO_LAUNCH) {
-            wrapperIpaPath = ensureWrapperIpaUnpacked();
+        // getArguments() and starts the Rust main shortly after; if
+        // wrapperIpaPath isn't set yet, touchHLE will fall back to the
+        // app-picker, and if TOUCHHLE_USER_DATA_BASE_PATH isn't set yet,
+        // paths.rs will cache the default /sdcard/touchHLE location and
+        // never re-check.
+        if (BuildConfig.WRAPPER_AUTO_LAUNCH
+                && BuildConfig.WRAPPER_USER_DATA_DIR != null
+                && !BuildConfig.WRAPPER_USER_DATA_DIR.isEmpty()) {
+            userDataDir = BuildConfig.WRAPPER_USER_DATA_DIR;
+            musicLibraryFile = userDataDir + "/touchHLE_music_library.txt";
+            // Make sure the folder exists so the user can drop the IPA in
+            // even before granting MANAGE_EXTERNAL_STORAGE has fully
+            // propagated -- best effort, ignore failure.
+            //noinspection ResultOfMethodCallIgnored
+            new File(userDataDir).mkdirs();
+            // Tell the Rust side to use this folder for its user data.
+            // Must be set before super.onCreate so getenv() on the native
+            // thread sees it on first lookup.
+            try {
+                Os.setenv(ENV_USER_DATA_BASE_PATH, userDataDir, true);
+                Log.i(TAG, "wrapper: " + ENV_USER_DATA_BASE_PATH + "=" + userDataDir);
+            } catch (Exception e) {
+                Log.w(TAG, "wrapper: couldn't set " + ENV_USER_DATA_BASE_PATH + ": " + e);
+            }
+            wrapperIpaPath = resolveExternalWrapperIpa();
         }
         // Extract the album-art placeholder bundled in assets to the
         // user-data folder so the Rust runtime can fs::read it. Safe to
@@ -95,6 +141,16 @@ public class MainActivity extends SDLActivity {
         // present at the right size.
         ensureAlbumPlaceholderUnpacked();
         super.onCreate(savedInstanceState);
+        // If the wrapper couldn't find its IPA, surface that as a Toast
+        // now that the activity window is up. We still let SDL/touchHLE
+        // start so the user can see something (the app picker as a
+        // fallback) instead of an opaque black screen.
+        if (wrapperMissingIpaReason != null) {
+            final String msg = wrapperMissingIpaReason;
+            new Handler(Looper.getMainLooper()).post(() ->
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            );
+        }
         new Handler(Looper.getMainLooper()).postDelayed(
             this::runFirstLaunchSetup,
             SETUP_PROMPT_DELAY_MS
@@ -102,13 +158,15 @@ public class MainActivity extends SDLActivity {
     }
 
     /**
-     * In wrapper-flavor builds (BuildConfig.WRAPPER_AUTO_LAUNCH = true),
-     * return the absolute path to the bundled IPA so touchHLE's Rust main
-     * skips the app picker and launches the game directly.
+     * In wrapper-flavor builds (BuildConfig.WRAPPER_AUTO_LAUNCH = true)
+     * with the IPA present at {@link #wrapperIpaPath}, return that path
+     * so touchHLE's Rust main skips the app picker and launches the
+     * game directly.
      *
-     * In the generic touchhle flavor we return {@code super.getArguments()}
-     * (an empty array), preserving the historical "show app picker"
-     * behaviour.
+     * In the generic touchhle flavor -- or in the wrapper flavor when
+     * the IPA is missing from the public user-data folder -- we return
+     * {@code super.getArguments()} (an empty array), preserving the
+     * "show app picker" behaviour.
      */
     @Override
     protected String[] getArguments() {
@@ -120,57 +178,30 @@ public class MainActivity extends SDLActivity {
     }
 
     /**
-     * Extract the IPA bundled in {@code assets/<WRAPPER_IPA_ASSET>} into the
-     * app's internal-storage files dir, named with the human-readable
-     * {@code WRAPPER_IPA_FILENAME}. Idempotent: if a same-sized file already
-     * exists at the destination we return its path without re-copying
-     * (saves ~260 MB of I/O on every launch after the first).
+     * Look for the wrapper's IPA at {@code <WRAPPER_USER_DATA_DIR>/<WRAPPER_IPA_FILENAME>}
+     * on public storage. The user is expected to have copied it there
+     * themselves (we no longer bundle the ~260 MB blob inside the APK).
      *
-     * Returns the absolute path on success, or null on failure (in which
-     * case the wrapper falls back to the picker, like the generic flavor).
+     * Returns the absolute path on success, or null if the file is missing.
+     * On null, {@link #wrapperMissingIpaReason} is set to a user-facing
+     * message that {@link #onCreate} will surface as a Toast.
      */
-    private String ensureWrapperIpaUnpacked() {
-        String asset = BuildConfig.WRAPPER_IPA_ASSET;
+    private String resolveExternalWrapperIpa() {
         String fname = BuildConfig.WRAPPER_IPA_FILENAME;
-        if (asset == null || asset.isEmpty() || fname == null || fname.isEmpty()) {
+        if (fname == null || fname.isEmpty()) {
             return null;
         }
-        File dest = new File(getFilesDir(), fname);
-        long expectedSize;
-        try (android.content.res.AssetFileDescriptor afd = getAssets().openFd(asset)) {
-            // Reliable byte count for an uncompressed asset (we mark .ipa
-            // noCompress in build.gradle.kts so openFd works -- compressed
-            // assets fail with FileNotFoundException here).
-            expectedSize = afd.getLength();
-        } catch (IOException e) {
-            Log.e(TAG, "Bundled IPA asset \"" + asset + "\" not openable as FD "
-                + "(was build.gradle's noCompress(\"ipa\") in effect?): " + e);
-            return null;
+        File ipa = new File(userDataDir, fname);
+        if (ipa.isFile() && ipa.length() > 0) {
+            Log.i(TAG, "wrapper: using IPA at " + ipa.getAbsolutePath()
+                + " (" + ipa.length() + " bytes).");
+            return ipa.getAbsolutePath();
         }
-        if (dest.isFile() && dest.length() == expectedSize) {
-            // Already unpacked from a previous launch.
-            return dest.getAbsolutePath();
-        }
-        Log.i(TAG, "Unpacking bundled IPA \"" + asset + "\" -> " + dest.getAbsolutePath()
-            + " (" + expectedSize + " bytes).");
-        long t0 = System.currentTimeMillis();
-        try (InputStream in = getAssets().open(asset);
-             FileOutputStream out = new FileOutputStream(dest)) {
-            byte[] buf = new byte[64 * 1024];
-            int n;
-            while ((n = in.read(buf)) > 0) {
-                out.write(buf, 0, n);
-            }
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to unpack bundled IPA: " + e);
-            // Don't leave a half-written file around -- next launch would
-            // size-match and skip the copy, leaving us with a corrupt bundle.
-            //noinspection ResultOfMethodCallIgnored
-            dest.delete();
-            return null;
-        }
-        Log.i(TAG, "Unpacked IPA in " + (System.currentTimeMillis() - t0) + " ms.");
-        return dest.getAbsolutePath();
+        wrapperMissingIpaReason =
+            "Drop " + fname + " into " + userDataDir + " and relaunch.";
+        Log.w(TAG, "wrapper: IPA not found at " + ipa.getAbsolutePath()
+            + " -- falling back to app picker. " + wrapperMissingIpaReason);
+        return null;
     }
 
     /**
@@ -179,8 +210,8 @@ public class MainActivity extends SDLActivity {
      * plain {@code fs::read("res/album_placeholder.png")} keyed off
      * user_data_base_path on Android) can find it. We write to BOTH
      * candidate locations the Rust paths logic might resolve to:
-     *   - /sdcard/touchHLE/res/   (preferred; only writable once the user
-     *                              grants MANAGE_EXTERNAL_STORAGE)
+     *   - <userDataDir>/res/      (preferred; only writable once the
+     *                              user grants MANAGE_EXTERNAL_STORAGE)
      *   - getExternalFilesDir/res (always writable; fallback the Rust
      *                              side falls back to as well)
      * That way the file is in place before *or* after the user grants
@@ -209,7 +240,7 @@ public class MainActivity extends SDLActivity {
             }
         }
         java.util.ArrayList<File> targets = new java.util.ArrayList<>();
-        targets.add(new File("/sdcard/touchHLE/res/" + ASSET));
+        targets.add(new File(userDataDir + "/res/" + ASSET));
         File ext = getExternalFilesDir(null);
         if (ext != null) {
             targets.add(new File(ext, "res/" + ASSET));
@@ -228,7 +259,7 @@ public class MainActivity extends SDLActivity {
                 }
                 Log.i(TAG, "Extracted " + ASSET + " -> " + dest.getAbsolutePath());
             } catch (IOException e) {
-                // Permission-denied on /sdcard/touchHLE/ before
+                // Permission-denied on the public user-data dir before
                 // MANAGE_EXTERNAL_STORAGE is granted is normal -- the
                 // fallback ext-files path will succeed.
                 Log.i(TAG, "Could not extract " + ASSET + " to "
@@ -295,13 +326,13 @@ public class MainActivity extends SDLActivity {
     private static boolean pickedThisLaunch = false;
 
     /**
-     * Returns true iff {@link #MUSIC_LIBRARY_FILE} exists, can be read, and
+     * Returns true iff {@link #musicLibraryFile} exists, can be read, and
      * its trimmed contents name a directory that currently exists. Anything
      * else (file missing, empty, non-absolute path, deleted folder) counts
      * as "no valid path" and triggers a re-prompt.
      */
-    private static boolean isSavedMusicLibraryPathValid() {
-        File libFile = new File(MUSIC_LIBRARY_FILE);
+    private boolean isSavedMusicLibraryPathValid() {
+        File libFile = new File(musicLibraryFile);
         if (!libFile.isFile()) {
             return false;
         }
@@ -316,7 +347,7 @@ public class MainActivity extends SDLActivity {
             }
             return new File(trimmed).isDirectory();
         } catch (Exception e) {
-            Log.w(TAG, "Couldn't read " + MUSIC_LIBRARY_FILE + ": " + e);
+            Log.w(TAG, "Couldn't read " + musicLibraryFile + ": " + e);
             return false;
         }
     }
@@ -347,7 +378,7 @@ public class MainActivity extends SDLActivity {
     }
 
     private boolean openMusicFolderPicker() {
-        // CRITICAL: write a fallback path to MUSIC_LIBRARY_FILE *before*
+        // CRITICAL: write a fallback path to musicLibraryFile *before*
         // we fire the SAF picker. Launching the picker backgrounds
         // touchHLE, and touchHLE's app-will-resign-active handler in
         // uikit.rs exits the whole process before our onActivityResult
@@ -390,17 +421,17 @@ public class MainActivity extends SDLActivity {
      * Choose the music-folder fallback to pre-seed before opening SAF.
      * Tries the well-known external-storage music locations and returns
      * the one with the most audio files. If none have any music we still
-     * return (and create) /sdcard/touchHLE/Music so there's a writable
+     * return (and create) <userDataDir>/Music so there's a writable
      * destination for the user to drop files into later.
      *
      * Mirrors the Rust-side candidate set in
      * music_library.rs::prompt_for_folder so picker-side and Rust-side
      * fallbacks agree on which folder "wins".
      */
-    private static String pickBestCandidateMusicFolder() {
+    private String pickBestCandidateMusicFolder() {
         String[] candidates = new String[] {
             "/sdcard/Music",
-            "/sdcard/touchHLE/Music",
+            userDataDir + "/Music",
             "/sdcard/Download",
         };
         String best = null;
@@ -422,9 +453,9 @@ public class MainActivity extends SDLActivity {
             Log.i(TAG, "pre-seeding music folder with best candidate: " + best);
             return best;
         }
-        // Nothing useful found — still create /sdcard/touchHLE/Music so the
+        // Nothing useful found — still create <userDataDir>/Music so the
         // user has somewhere obvious to drop files later.
-        File seed = new File("/sdcard/touchHLE/Music");
+        File seed = new File(userDataDir + "/Music");
         if (!seed.isDirectory()) {
             seed.mkdirs();
         }
@@ -469,19 +500,19 @@ public class MainActivity extends SDLActivity {
         return n;
     }
 
-    /** Best-effort write of an absolute path into MUSIC_LIBRARY_FILE.
+    /** Best-effort write of an absolute path into {@link #musicLibraryFile}.
      *  Logs (and swallows) any I/O error: the worst case is the prompt
      *  fires again next launch, which is no worse than before. */
-    private static void writeMusicLibraryFile(String absolutePath) {
+    private void writeMusicLibraryFile(String absolutePath) {
         try {
-            File parent = new File(MUSIC_LIBRARY_FILE).getParentFile();
+            File parent = new File(musicLibraryFile).getParentFile();
             if (parent != null && !parent.isDirectory()) {
                 parent.mkdirs();
             }
-            try (FileOutputStream out = new FileOutputStream(MUSIC_LIBRARY_FILE)) {
+            try (FileOutputStream out = new FileOutputStream(musicLibraryFile)) {
                 out.write(absolutePath.getBytes("UTF-8"));
             }
-            Log.i(TAG, "Wrote music folder to " + MUSIC_LIBRARY_FILE + ": " + absolutePath);
+            Log.i(TAG, "Wrote music folder to " + musicLibraryFile + ": " + absolutePath);
         } catch (Exception e) {
             Log.e(TAG, "Couldn't persist music folder choice: " + e);
         }

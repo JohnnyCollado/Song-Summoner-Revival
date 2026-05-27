@@ -118,12 +118,35 @@ pub const SANDBOX_DIR: &str = "touchHLE_sandbox";
 /// which any file manager can browse. We probe by trying to create the
 /// directory: if MANAGE_EXTERNAL_STORAGE is granted it succeeds, otherwise
 /// we get EACCES back and fall back to the private folder.
+///
+/// The default `/sdcard/touchHLE` location can be overridden by setting the
+/// `TOUCHHLE_USER_DATA_BASE_PATH` env var before this is first called. The
+/// `songsummoner` wrapper flavor uses this to redirect user data to
+/// `/sdcard/SongSummoner/`, alongside its IPA. The override only applies
+/// if the path is actually usable (same mkdir + write-probe as the default);
+/// otherwise we still fall back to the private app-files dir.
 #[cfg(target_os = "android")]
 fn resolve_android_user_data_path() -> PathBuf {
     use std::sync::OnceLock;
     static CACHED: OnceLock<PathBuf> = OnceLock::new();
     CACHED
         .get_or_init(|| {
+            // Honour a Java-side override (set by MainActivity via Os.setenv
+            // before super.onCreate). Used by the songsummoner wrapper.
+            if let Ok(override_path) = std::env::var("TOUCHHLE_USER_DATA_BASE_PATH") {
+                let override_path = override_path.trim();
+                if !override_path.is_empty() {
+                    let p = PathBuf::from(override_path);
+                    if public_path_is_usable(&p) {
+                        return p;
+                    }
+                    // Override was set but unusable -- log via the lazy log
+                    // would risk the same boot-panic we guard against below,
+                    // so just fall through. main() prints user_data_base_path
+                    // once the log file is ready, which makes the divergence
+                    // obvious.
+                }
+            }
             // Try the public /sdcard/touchHLE location first. We must do BOTH
             // a mkdir AND a real file write to confirm the path works -- on
             // some Android variants (notably BlueStacks and scoped-storage

@@ -1,10 +1,10 @@
 @echo off
 REM ---------------------------------------------------------------------
 REM Install + launch the Song Summoner WRAPPER build on a connected
-REM Android device via adb. Force-stops any previous instance, installs
-REM the freshly built wrapper APK (.ipa is bundled inside it -- no need
-REM to push anything to /sdcard), launches the activity, then tails the
-REM relevant log streams.
+REM Android device via adb. The wrapper APK no longer bundles the IPA;
+REM this script pushes the .ipa AND the options file into
+REM /sdcard/SongSummoner/ before launching, so the wrapper finds
+REM everything it needs in one folder.
 REM
 REM Double-click this from F:\ios_emu\. Ctrl+C in the window stops the
 REM log tail; the app keeps running on the phone.
@@ -80,26 +80,45 @@ echo.
 echo [1/5] Stopping any previous instance of %PKG%...
 "%ADB%" shell am force-stop %PKG%
 
-echo [2/5] Installing %APK%...
+echo [2/6] Installing %APK%...
 "%ADB%" install -r "%APK%"
 if errorlevel 1 (
     echo [ERROR] install failed; see message above. Common causes:
     echo   - signature mismatch ^(uninstall existing wrapper and rerun^)
-    echo   - storage full ^(wrapper APK is ~285 MB and unpacks an IPA on first launch^)
+    echo   - storage full
     pause
     exit /b 1
 )
 
-echo [3/5] Syncing local touchHLE_options.txt to /sdcard/touchHLE/...
-REM Wrapper still reads /sdcard/touchHLE/touchHLE_options.txt at launch,
-REM so we mirror the Windows-side controller layout here.
-"%ADB%" shell mkdir -p /sdcard/touchHLE >nul 2>&1
-"%ADB%" push "%~dp0touchHLE_options.txt" /sdcard/touchHLE/touchHLE_options.txt
+REM ---------------------------------------------------------------------
+REM Locate the Song Summoner IPA on the host. Prefer the one in apps/,
+REM which is where the rest of the repo expects it.
+REM ---------------------------------------------------------------------
+set IPA_NAME=Song Summoner The Unsung Heroes Encore.ipa
+set IPA=
+if exist "%~dp0apps\%IPA_NAME%" set IPA=%~dp0apps\%IPA_NAME%
 
-echo [4/5] Clearing logcat buffer...
+echo [3/6] Ensuring /sdcard/SongSummoner/ exists on device...
+"%ADB%" shell mkdir -p /sdcard/SongSummoner >nul 2>&1
+
+echo [4/6] Syncing IPA + touchHLE_options.txt to /sdcard/SongSummoner/...
+if defined IPA (
+    REM `adb push --sync` skips the transfer when local and remote mtime
+    REM + size already match, so the ~260 MB push only happens once per
+    REM modified IPA.
+    "%ADB%" push --sync "%IPA%" "/sdcard/SongSummoner/%IPA_NAME%"
+) else (
+    echo       [WARN] No IPA found at %~dp0apps\%IPA_NAME% -- skipping push.
+    echo              Drop the file there ^(or directly into /sdcard/SongSummoner/ on the device^) and rerun.
+)
+REM Wrapper reads /sdcard/SongSummoner/touchHLE_options.txt at launch,
+REM so we mirror the Windows-side controller layout here.
+"%ADB%" push "%~dp0touchHLE_options.txt" /sdcard/SongSummoner/touchHLE_options.txt
+
+echo [5/6] Clearing logcat buffer...
 "%ADB%" logcat -c
 
-echo [5/5] Launching %ACT% and streaming logs.
+echo [6/6] Launching %ACT% and streaming logs.
 echo       Ctrl+C to stop tailing (app keeps running on phone).
 echo.
 "%ADB%" shell am start -n %ACT% >nul

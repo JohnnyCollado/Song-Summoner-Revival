@@ -127,6 +127,80 @@ pub enum FingerId {
 }
 pub type Coords = (f32, f32);
 
+/// How long the virtual cursor stays on-screen after the last "active"
+/// input (stick movement or tap-button press) before fading. Applies to
+/// both absolute and mouse-style modes; long enough that a mid-decision
+/// pause doesn't drop the cursor, short enough that an idle controller
+/// or a stuck stick eventually clears the overlay.
+pub const CURSOR_AUTOHIDE_SECS: f32 = 3.0;
+
+/// Which sprite the virtual cursor should be drawn as. Selected by the
+/// renderer in [crate::gles::present::present_frame] when sprite assets
+/// are bundled at `res/cursor_{hand,tap,drag}.png`; falls back to a black
+/// dot for whichever variant has no sprite file.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CursorVisual {
+    /// Resting cursor — the tap button is not held.
+    Idle,
+    /// Tap button held but the cursor hasn't moved while it was held.
+    Tap,
+    /// Tap button held and the cursor has moved since the press began.
+    /// "Latches" — once a drag starts, the visual stays Drag until the
+    /// press ends, even if the user momentarily stops moving the stick.
+    Drag,
+}
+
+/// Decoded RGBA sprites for the virtual cursor, loaded once at
+/// [Window::new]. Each is [None] if its PNG isn't on disk — the renderer
+/// then falls back to the legacy black-dot draw for that state.
+pub struct CursorSpriteImages {
+    pub idle: Option<Image>,
+    pub tap: Option<Image>,
+    pub drag: Option<Image>,
+}
+
+impl CursorSpriteImages {
+    fn load() -> Self {
+        fn try_load(rel_path: &str) -> Option<Image> {
+            let mut f = crate::paths::ResourceFile::open(rel_path).ok()?;
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(f.get(), &mut buf).ok()?;
+            match Image::from_bytes(&buf) {
+                Ok(img) => Some(img),
+                Err(e) => {
+                    log!("Couldn't decode cursor sprite {rel_path}: {e}");
+                    None
+                }
+            }
+        }
+        // User's filenames take precedence; fall back to the
+        // underscore-cased aliases if someone follows the README naming.
+        let idle = try_load("res/Cursor Pointer.png")
+            .or_else(|| try_load("res/cursor_hand.png"));
+        let tap = try_load("res/Cursor Select.png")
+            .or_else(|| try_load("res/cursor_tap.png"));
+        let drag = try_load("res/Cursor Move.png")
+            .or_else(|| try_load("res/cursor_drag.png"));
+        if idle.is_some() || tap.is_some() || drag.is_some() {
+            log!(
+                "Cursor sprites loaded: idle={} tap={} drag={}",
+                idle.is_some(),
+                tap.is_some(),
+                drag.is_some()
+            );
+        }
+        CursorSpriteImages { idle, tap, drag }
+    }
+
+    pub fn for_state(&self, state: CursorVisual) -> Option<&Image> {
+        match state {
+            CursorVisual::Idle => self.idle.as_ref(),
+            CursorVisual::Tap => self.tap.as_ref(),
+            CursorVisual::Drag => self.drag.as_ref(),
+        }
+    }
+}
+
 struct DpadState {
     left: bool,
     right: bool,
@@ -236,6 +310,32 @@ pub struct Window {
     accelerometer: Option<sdl2::sensor::Sensor>,
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
+    /// Most recent wall-clock time the cursor saw "active" input from
+    /// the controller — stick deflection out of the deadzone or the tap
+    /// button held. Used by both the absolute- and mouse-style cursor
+    /// paths to hide the on-screen cursor after CURSOR_AUTOHIDE_SECS of
+    /// idle time, so a controller left with its stick held deflected (or
+    /// a player who walked away) doesn't leave a stale pointer on the
+    /// game's UI. `None` until the cursor first sees any input.
+    cursor_last_input_time: Option<Instant>,
+    /// Latched true once the cursor moves while the tap button is held,
+    /// cleared on release. Used to pick between the Tap and Drag sprites
+    /// without flickering when the user momentarily stops moving the
+    /// stick mid-drag.
+    cursor_drag_latched: bool,
+    /// Decoded sprite PNGs for the virtual cursor. Loaded once at
+    /// construction. Each variant is independent — a sprite missing for
+    /// one state falls back to the legacy black-dot draw for that state
+    /// only. Wrapped in `Arc` so render code can grab a cheap handle
+    /// before mutably borrowing the rest of `Window` for the GL context.
+    pub cursor_sprites: std::sync::Arc<CursorSpriteImages>,
+    /// Per-tick / per-input timestamps used by the mouse-style virtual
+    /// cursor mode (`--mouse-style-cursor=`). `last_tick` is the previous
+    /// `update_virtual_cursor` time, used to integrate velocity over
+    /// elapsed wall time; `last_input` is the most recent time the stick
+    /// left the deadzone or a tap button was pressed, used to drive the
+    /// idle-autohide timer. `None` when mouse-style mode isn't active.
+    mouse_cursor_times: Option<(Instant, Instant)>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
     /// Phase 1 of the modular virtual cursor system (see [crate::input]).
     /// Driven by analog-stick / button events and ticked once per event-poll
@@ -401,6 +501,10 @@ impl Window {
             accelerometer,
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
+            cursor_last_input_time: None,
+            cursor_drag_latched: false,
+            cursor_sprites: std::sync::Arc::new(CursorSpriteImages::load()),
+            mouse_cursor_times: None,
             virtual_accelerometer_last: None,
             vcursor: crate::input::VirtualCursor::new((
                 0.0,
@@ -913,6 +1017,35 @@ impl Window {
                     Event::EnterDebugger
                 }
                 E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F11),
+                    repeat: false,
+                    ..
+                } => {
+                    // Toggle borderless fullscreen on platforms where it
+                    // matters. Android (`rotatable_fullscreen`) is always
+                    // fullscreen at the OS level so this is a no-op there.
+                    // We use Desktop (borderless, same resolution) rather
+                    // than True (mode-switching) — quicker toggle, no
+                    // resolution flicker.
+                    if !Self::rotatable_fullscreen() {
+                        let new_state = if self.fullscreen {
+                            sdl2::video::FullscreenType::Off
+                        } else {
+                            sdl2::video::FullscreenType::Desktop
+                        };
+                        if let Err(e) = self.window.set_fullscreen(new_state) {
+                            log!("Couldn't toggle fullscreen: {}", e);
+                        } else {
+                            self.fullscreen = !self.fullscreen;
+                            echo!(
+                                "F11: window is now {}.",
+                                if self.fullscreen { "fullscreen" } else { "windowed" }
+                            );
+                        }
+                    }
+                    continue;
+                }
+                E::KeyDown {
                     keycode: Some(sdl2::keyboard::Keycode::Backspace),
                     ..
                 } => {
@@ -966,7 +1099,13 @@ impl Window {
             }
         }
 
-        if controller_updated {
+        // In mouse-style mode the cursor integrates stick deflection as a
+        // velocity over wall-time, so it has to tick every poll iteration
+        // even when no axis event arrived (SDL only fires axis events on
+        // value-change, not while a stick is held at a steady deflection).
+        // Absolute mode is purely event-driven, so we keep the historical
+        // controller_updated gate there.
+        if controller_updated || options.mouse_style_cursor.is_some() {
             let (new_x, new_y, pressed, pressed_changed, moved) =
                 self.update_virtual_cursor(options);
             self.event_queue
@@ -1008,8 +1147,11 @@ impl Window {
             return;
         }
         log!(
-            "New controller connected: {}. Left stick = device tilt. Right stick = touch input (press the stick or shoulder button to tap/hold).",
-            controller_name
+            "New controller connected: {}. {}",
+            controller_name,
+            "Stick mapping depends on --swap-sticks: by default Left = device tilt / drag, \
+             Right = virtual cursor (R3 or RB to tap/hold). With --swap-sticks the assignments \
+             flip and the tap signal becomes L3 or RB."
         );
         self.controllers.push(controller);
     }
@@ -1028,7 +1170,11 @@ impl Window {
         log!("This app uses the accelerometer.");
 
         if !self.controllers.is_empty() && options.analog_stick_tilt_controls {
-            log!("Your connected controller's left analog stick will be used for accelerometer simulation.");
+            let tilt_stick = if options.swap_sticks { "right" } else { "left" };
+            log!(
+                "Your connected controller's {} analog stick will be used for accelerometer simulation.",
+                tilt_stick
+            );
             if self.accelerometer.is_some() {
                 log!("Disconnect the controller if you want to use your device's accelerometer.");
             }
@@ -1082,8 +1228,13 @@ impl Window {
                 .map(|(x, y, _right_click_hold)| (x, y))
                 .unwrap()
         } else {
-            // Get left analog stick input. The range is [-1, 1] on each axis.
-            let (x, y, _) = self.get_controller_stick(options, true);
+            // Get the tilt-stick input. The range is [-1, 1] on each axis.
+            // Default = left stick; with --swap-sticks the LEFT stick drives
+            // the virtual cursor, so tilt simulation moves to the RIGHT stick
+            // to avoid the cursor and the device-tilt fighting over the same
+            // physical input.
+            let read_left = !options.swap_sticks;
+            let (x, y, _) = self.get_controller_stick(options, read_left);
             (x, y)
         };
 
@@ -1119,22 +1270,32 @@ impl Window {
     }
 
     /// For use when redrawing the screen: Get the cached on-screen position and
-    /// press state of the analog stick-controlled virtual cursor, if it is
-    /// visible.
-    pub fn virtual_cursor_visible_at(&self) -> Option<(f32, f32, bool)> {
+    /// visual state of the analog stick-controlled virtual cursor, if it is
+    /// currently visible. Visual state determines which sprite (idle/tap/drag)
+    /// the renderer picks.
+    pub fn virtual_cursor_visible_at(&self) -> Option<(f32, f32, CursorVisual)> {
         let (x, y, pressed, visible) = self.virtual_cursor_last?;
-        if visible {
-            // When stickyness is in use, the visual cursor movement appears
-            // uncomfortably choppy. Showing the un-sticky position is a bit
-            // misleading but it *feels* better, and it is documented.
-            if let Some((x_unsticky, y_unsticky, _time)) = self.virtual_cursor_last_unsticky {
-                Some((x_unsticky, y_unsticky, pressed))
-            } else {
-                Some((x, y, pressed))
-            }
-        } else {
-            None
+        if !visible {
+            return None;
         }
+        let visual = if !pressed {
+            CursorVisual::Idle
+        } else if self.cursor_drag_latched {
+            CursorVisual::Drag
+        } else {
+            CursorVisual::Tap
+        };
+        // When stickyness is in use, the visual cursor movement appears
+        // uncomfortably choppy. Showing the un-sticky position is a bit
+        // misleading but it *feels* better, and it is documented.
+        let (x, y) = if let Some((x_unsticky, y_unsticky, _time)) =
+            self.virtual_cursor_last_unsticky
+        {
+            (x_unsticky, y_unsticky)
+        } else {
+            (x, y)
+        };
+        Some((x, y, visual))
     }
 
     /// Update the virtual cursor's position, click state and visibility, then
@@ -1164,9 +1325,19 @@ impl Window {
             pressed_raw
         };
 
-        // The cursor is intended to only show up once you move the analog stick
-        // out of its deadzone, or while the button is held.
-        let visible = pressed || x != 0.0 || y != 0.0;
+        // --mouse-style-cursor=SPEED: branch off into velocity-integration
+        // mode. The cursor keeps its on-screen position between calls, the
+        // stick deflection acts as a px/sec velocity, and the cursor auto-
+        // hides after MOUSE_AUTOHIDE_SECS of idle time (no stick input, no
+        // tap-button press). This whole branch returns; the absolute-mode
+        // code below is only reached when --mouse-style-cursor isn't set.
+        if let Some(speed) = options.mouse_style_cursor {
+            return self.update_mouse_style_cursor(speed, x, y, pressed);
+        }
+
+        // Capture pre-conversion stick state for the autohide check
+        // before x/y get rebound to screen coords below.
+        let stick_deflected = x != 0.0 || y != 0.0;
 
         // Though the analog stick output fits within a square, its actual range
         // is usually a circle enclosed by the square. So we need to cut out the
@@ -1234,6 +1405,30 @@ impl Window {
             (x, y)
         };
 
+        // Drag-latch bookkeeping: reset on press-down, latch on any
+        // movement during a press. Render layer picks Tap vs Drag from
+        // this in `virtual_cursor_visible_at`.
+        if pressed && !old_pressed {
+            self.cursor_drag_latched = false;
+        } else if pressed && (x != old_x || y != old_y) {
+            self.cursor_drag_latched = true;
+        }
+        // Autohide: even if the stick is held deflected (so the cursor
+        // would otherwise stay visible), fade it out after a few seconds
+        // of no movement and no tap-button press. This catches the
+        // "stick stuck against the bumper" / "controller left on the
+        // couch" cases where the cursor would otherwise sit on top of
+        // the game UI indefinitely.
+        let now = Instant::now();
+        let moved = x != old_x || y != old_y;
+        if pressed || moved {
+            self.cursor_last_input_time = Some(now);
+        }
+        let recently_active = self
+            .cursor_last_input_time
+            .map(|t| now.saturating_duration_since(t).as_secs_f32() < CURSOR_AUTOHIDE_SECS)
+            .unwrap_or(false);
+        let visible = pressed || (stick_deflected && recently_active);
         self.virtual_cursor_last = Some((x, y, pressed, visible));
 
         (
@@ -1242,6 +1437,77 @@ impl Window {
             pressed,
             pressed != old_pressed,
             x != old_x || y != old_y,
+        )
+    }
+
+    /// Mouse-style virtual cursor: the stick acts as a velocity, not a
+    /// position. The cursor keeps its on-screen spot between calls, only
+    /// moves while the stick is deflected (px/sec equal to `speed` at full
+    /// deflection), and fades out after a short idle window so it doesn't
+    /// sit on top of the game UI when the user isn't using it.
+    ///
+    /// Returns the same `(x, y, pressed, pressed_changed, moved)` shape as
+    /// the absolute-mode path so the caller can stay branch-free.
+    fn update_mouse_style_cursor(
+        &mut self,
+        speed: f32,
+        sx: f32,
+        sy: f32,
+        pressed: bool,
+    ) -> (f32, f32, bool, bool, bool) {
+        let now = Instant::now();
+        let (last_tick, last_input) = self.mouse_cursor_times.unwrap_or((now, now));
+        // Clamp dt so a long stall (paused process, backgrounded app, debugger
+        // break, etc.) doesn't make the cursor teleport across the screen on
+        // the next tick. 0.1s matches the ChaosRing cap.
+        let dt = now
+            .saturating_duration_since(last_tick)
+            .as_secs_f32()
+            .min(0.1);
+
+        let (vx, vy, vw, vh) = self.viewport();
+        let (vx, vy, vw, vh) = (vx as f32, vy as f32, vw as f32, vh as f32);
+
+        // Seed the position from the previous frame, or centre-of-viewport
+        // on the very first tick so the cursor enters from a sane spot.
+        let (old_x, old_y, old_pressed, _) = self
+            .virtual_cursor_last
+            .unwrap_or((vx + vw * 0.5, vy + vh * 0.5, false, false));
+
+        // Square the per-axis deflection magnitude so small stick movements
+        // give fine precision (good for menu targeting) and full deflection
+        // gives fast travel. `sx * sx.abs()` preserves the sign while
+        // making the response curve quadratic — same shape ChaosRing uses.
+        let vx_step = sx * sx.abs() * speed * dt;
+        let vy_step = sy * sy.abs() * speed * dt;
+        let new_x = (old_x + vx_step).clamp(vx, vx + vw);
+        let new_y = (old_y + vy_step).clamp(vy, vy + vh);
+
+        let active = pressed || sx != 0.0 || sy != 0.0;
+        let last_input = if active { now } else { last_input };
+        // Also update the shared autohide timestamp so a switch back to
+        // absolute mode without restarting wouldn't see a stale value.
+        if active {
+            self.cursor_last_input_time = Some(now);
+        }
+        let idle = now.saturating_duration_since(last_input).as_secs_f32();
+        let visible = pressed || idle < CURSOR_AUTOHIDE_SECS;
+
+        // Drag-latch bookkeeping (see `update_virtual_cursor` for the why).
+        if pressed && !old_pressed {
+            self.cursor_drag_latched = false;
+        } else if pressed && (new_x != old_x || new_y != old_y) {
+            self.cursor_drag_latched = true;
+        }
+        self.mouse_cursor_times = Some((now, last_input));
+        self.virtual_cursor_last = Some((new_x, new_y, pressed, visible));
+
+        (
+            new_x,
+            new_y,
+            pressed,
+            pressed != old_pressed,
+            new_x != old_x || new_y != old_y,
         )
     }
 
@@ -1392,6 +1658,7 @@ impl Window {
                 viewport,
                 matrix,
                 /* virtual_cursor_visible_at: */ None,
+                &self.cursor_sprites,
             );
 
             gl_ctx.DeleteTextures(1, &texture);
