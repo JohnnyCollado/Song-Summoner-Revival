@@ -33,8 +33,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!-- Storage access for the user's iOS app collection. On Android 11+ this
-         must be granted manually under Settings -> Apps -> touchHLE ->
-         Permissions -> Files and media -> "Allow management of all files".
+         is granted through the "All files access" Settings page, which
+         SetupActivity opens on launch.
          Once granted, touchHLE places its user-data folder (apps, options,
          wallpaper, sandbox) at /sdcard/touchHLE/, which is visible to any
          file manager. Without the permission we silently fall back to the
@@ -82,6 +82,22 @@
         <meta-data android:name="SDL_ENV.SDL_ACCELEROMETER_AS_JOYSTICK" android:value="0"/>
          -->
 
+        <!-- Launcher: runs storage-permission and music-folder setup before
+             touchHLE starts (touchHLE exits whenever it loses focus, so these
+             prompts can't be shown once MainActivity is running), then
+             starts MainActivity and finishes. -->
+        <activity
+            android:name="org.touchhle.android.SetupActivity"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name="org.touchhle.android.MainActivity"
             android:alwaysRetainTaskState="true"
@@ -89,10 +105,6 @@
             android:exported="true"
             android:launchMode="singleInstance"
             android:preferMinimalPostProcessing="true">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
             <!-- Let Android know that we can handle some USB devices and should receive this event -->
             <intent-filter>
                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />

@@ -161,8 +161,6 @@ In `inspect/`:
 
 ## See also
 
-- `inspect/PROBLEM_FOR_CHATGPT.md` — full self-contained brief on the
-  bug context, useful when consulting external LLMs.
 - `inspect/RE_FINDINGS.md` — earlier RE writeup (the model evolved
   significantly; the "frame counter" insight in this doc supersedes
   the "state machine" model in RE_FINDINGS.md).

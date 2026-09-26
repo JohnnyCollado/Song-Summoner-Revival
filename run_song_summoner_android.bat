@@ -52,8 +52,10 @@ REM The songsummoner flavor adds ".songsummoner" to the application id,
 REM so the final package is "org.touchhle.android.songsummoner". The
 REM Java class for the activity lives in the original namespace though,
 REM so the component name must spell out the full class path.
+REM Launch SetupActivity (the launcher), not MainActivity, so the
+REM storage-permission and music-folder setup still runs.
 set PKG=org.touchhle.android.songsummoner
-set ACT=%PKG%/org.touchhle.android.MainActivity
+set ACT=%PKG%/org.touchhle.android.SetupActivity
 
 REM ---------------------------------------------------------------------
 REM Make sure a device is attached and authorized.
@@ -77,7 +79,7 @@ REM ---------------------------------------------------------------------
 REM Install, sync options (optional), launch, tail logs.
 REM ---------------------------------------------------------------------
 echo.
-echo [1/5] Stopping any previous instance of %PKG%...
+echo [1/6] Stopping any previous instance of %PKG%...
 "%ADB%" shell am force-stop %PKG%
 
 echo [2/6] Installing %APK%...

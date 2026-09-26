@@ -153,6 +153,15 @@ android {
         tasks.named("merge${variantName}Assets").configure {
             dependsOn("externalNativeBuild${variantName}")
         }
+        // Copy the finished APK into <repo-root>/dist/ after every assemble,
+        // so builds land in one predictable place.
+        val copyApkToDist = tasks.register<Copy>("copy${variantName}ApkToDist") {
+            from(packageApplicationProvider.flatMap { it.outputDirectory }) {
+                include("*.apk")
+            }
+            into("${rootDir.parentFile}/dist")
+        }
+        assembleProvider.configure { finalizedBy(copyApkToDist) }
     }
 
     sourceSets {
