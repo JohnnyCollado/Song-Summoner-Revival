@@ -6,12 +6,69 @@
  * Parts of this file are derived from SDL 2's Android project template, which
  * has a different license. Please see vendor/SDL/LICENSE.txt for details.
  */
+import javax.inject.Inject
 import org.gradle.nativeplatform.platform.internal.DefaultNativePlatform
+import org.gradle.process.ExecOperations
 
 plugins {
-    id("com.android.application") version("8.10.1")
-    id("com.github.willir.rust.cargo-ndk-android") version("0.3.4")
+    id("com.android.application") version("8.13.0")
     id("org.jetbrains.kotlin.android") version("2.0.21")
+}
+
+// Builds the Rust side with `cargo ndk` and copies the resulting libraries
+// into src/main/jniLibs/<abi>/, where AGP packages them.
+//
+// This replaces the com.github.willir.rust.cargo-ndk-android plugin, which
+// is unmaintained (last release 0.3.4, February 2021) and runs cargo through
+// Project.exec, deprecated for removal in Gradle 9. The command line, copy
+// locations and task names (buildCargoNdk<Variant>) match the plugin's.
+abstract class CargoNdkBuildTask : DefaultTask() {
+    @get:Inject
+    abstract val execOps: ExecOperations
+
+    // Directory holding the workspace Cargo.toml.
+    @get:Input
+    abstract val cargoDir: Property<String>
+    @get:Input
+    abstract val rustTarget: Property<String>
+    @get:Input
+    abstract val abi: Property<String>
+    @get:Input
+    abstract val platform: Property<Int>
+    // Arguments after `build`, e.g. --release and feature flags.
+    @get:Input
+    abstract val cargoArgs: ListProperty<String>
+    @get:Input
+    abstract val cargoEnv: MapProperty<String, String>
+    // Files copied from target/<triple>/release/.
+    @get:Input
+    abstract val libraries: ListProperty<String>
+    @get:Input
+    abstract val jniLibsDir: Property<String>
+
+    @TaskAction
+    fun build() {
+        val cargoRoot = File(cargoDir.get())
+        execOps.exec {
+            workingDir = cargoRoot
+            commandLine(
+                listOf(
+                    "cargo", "ndk",
+                    "--target", rustTarget.get(),
+                    "--platform", platform.get().toString(),
+                    "--", "build",
+                ) + cargoArgs.get()
+            )
+            environment(cargoEnv.get())
+        }
+        val from = cargoRoot.resolve("target/${rustTarget.get()}/release")
+        val to = File(jniLibsDir.get(), abi.get())
+        to.mkdirs()
+        for (lib in libraries.get()) {
+            from.resolve(lib).copyTo(to.resolve(lib), overwrite = true)
+            logger.info("Copied ${from.resolve(lib)} -> ${to.resolve(lib)}")
+        }
+    }
 }
 
 fun runTouchHLEVersionTool(wantBranding: Boolean): String {
@@ -31,6 +88,17 @@ fun getTouchHLEBranding(): String {
 
 fun getTouchHLEVersionName(): String {
     return runTouchHLEVersionTool(/* wantBranding: */ false)
+}
+
+// The plain workspace version from <repo>/Cargo.toml (e.g. "0.2.3"), used to
+// name the APKs copied out of the build tree. Unlike getTouchHLEVersionName
+// it carries no git suffix, so rebuilding a version replaces its APK.
+fun getCargoVersion(): String {
+    val toml = file("${rootDir.parentFile}/Cargo.toml").readText()
+    val section = toml.substringAfter("[workspace.package]")
+    return Regex("""(?m)^version\s*=\s*"([^"]+)"""")
+        .find(section)?.groupValues?.get(1)
+        ?: throw GradleException("No [workspace.package] version in Cargo.toml")
 }
 
 fun join(prefix: String, separator: String, branding: String): String {
@@ -78,7 +146,7 @@ android {
                 // its OpenGL ES implementations don't seem to work properly
                 // with touchHLE, so we disable it to reduce build time and
                 // avoid shipping stuff we haven't meaningfully tested.
-                // Make sure this matches the cargoNdk targets below.
+                // Make sure this matches the buildCargoNdk task below.
                 abiFilters("arm64-v8a")
             }
         }
@@ -99,7 +167,7 @@ android {
     //                       drops it into that folder themselves. All
     //                       touchHLE user data (options, sandbox, music
     //                       library, log) also lives in that folder.
-    // The Java side branches on BuildConfig.WRAPPER_AUTO_LAUNCH.
+    // The Kotlin side branches on BuildConfig.WRAPPER_AUTO_LAUNCH.
     flavorDimensions += "distribution"
     productFlavors {
         create("touchhle") {
@@ -108,8 +176,13 @@ android {
         }
         create("songsummoner") {
             dimension = "distribution"
-            // Distinct package id so both flavors can coexist on one device.
-            applicationIdSuffix = ".songsummoner"
+            // Own package id, outside touchHLE's org.touchhle.android
+            // namespace, so it never clashes with a real touchHLE install.
+            // Only the installed id changes: `namespace` (R, BuildConfig and
+            // the Kotlin package) stays org.touchhle.android, and the
+            // DocumentsProvider authority follows via ${applicationId}.
+            // CI builds would still get defaultConfig's branding suffix.
+            applicationId = "com.sqefam.songsummoner"
             versionNameSuffix = "-songsummoner"
             // App name shown under the launcher icon.
             resValue("string", "app_name", "Song Summoner")
@@ -153,15 +226,51 @@ android {
         tasks.named("merge${variantName}Assets").configure {
             dependsOn("externalNativeBuild${variantName}")
         }
-        // Copy the finished APK into <repo-root>/dist/ after every assemble,
-        // so builds land in one predictable place.
-        val copyApkToDist = tasks.register<Copy>("copy${variantName}ApkToDist") {
+        // Rust build. Every variant, debug included, builds Rust in release
+        // mode, as the old plugin did: a debug build of the emulator core is
+        // far too slow to play on.
+        val buildCargoNdk = tasks.register<CargoNdkBuildTask>("buildCargoNdk${variantName}") {
+            group = "build"
+            description = "Builds the Rust library for variant $variantName"
+            cargoDir.set(rootDir.parentFile.path)
+            // Make sure these match the android abiFilters above.
+            rustTarget.set("aarch64-linux-android")
+            abi.set("arm64-v8a")
+            platform.set(android.defaultConfig.minSdk ?: 21)
+            // The default feature, "static", makes us use static linking for
+            // SDL2 and OpenAL Soft. For Android, we need dynamic linking for
+            // SDL2, but static linking for OpenAL Soft.
+            cargoArgs.set(listOf(
+                "--release",
+                "--lib",
+                "--no-default-features",
+                "--features",
+                "touchHLE_openal_soft_wrapper/static,sdl2/bundled",
+            ))
+            cargoEnv.set(cargoNdkEnv())
+            libraries.set(listOf("libtouchHLE.so", "libSDL2.so", "libc++_shared.so"))
+            jniLibsDir.set("$projectDir/src/main/jniLibs")
+        }
+        // Same hook points the plugin used.
+        tasks.matching {
+            it.name == "compile${variantName}Sources" ||
+                it.name == "merge${variantName}JniLibFolders"
+        }.configureEach { dependsOn(buildCargoNdk) }
+        // Copy the finished APK out of the build tree after every assemble:
+        // release builds to <repo-root>/dist/, debug builds to
+        // <repo-root>/debug/, named <flavor>-<version>.apk
+        // (e.g. song-summoner-0.2.3.apk).
+        val outDir = if (buildType.name == "release") "dist" else "debug"
+        val apkPrefix = if (flavorName == "songsummoner") "song-summoner" else "touchhle"
+        val apkName = "$apkPrefix-${getCargoVersion()}.apk"
+        val copyApk = tasks.register<Copy>("copy${variantName}Apk") {
             from(packageApplicationProvider.flatMap { it.outputDirectory }) {
                 include("*.apk")
+                rename { apkName }
             }
-            into("${rootDir.parentFile}/dist")
+            into("${rootDir.parentFile}/$outDir")
         }
-        assembleProvider.configure { finalizedBy(copyApkToDist) }
+        assembleProvider.configure { finalizedBy(copyApk) }
     }
 
     sourceSets {
@@ -214,12 +323,9 @@ android {
     namespace = "org.touchhle.android"
 }
 
-cargoNdk {
-    // Make sure this matches the android abiFilters above.
-    targets = arrayListOf("arm64")
-    module = ".."
-    librariesNames = arrayListOf("libtouchHLE.so", "libSDL2.so", "libc++_shared.so")
-    extraCargoEnv = mapOf(
+// Environment for the `cargo ndk` build in CargoNdkBuildTask.
+fun cargoNdkEnv(): Map<String, String> {
+    val env = mutableMapOf(
         "ANDROID_NDK" to android.ndkDirectory.toString(),
         "ANDROID_NDK_HOME" to android.ndkDirectory.toString(),
     )
@@ -237,7 +343,7 @@ cargoNdk {
             throw GradleException("NDK clang++ compiler not found at expected location: $clangXXPath")
         }
 
-        extraCargoEnv.putAll(
+        env.putAll(
             mapOf(
                 "CC" to clangPath.toString(),
                 "CXX" to clangXXPath.toString(),
@@ -248,14 +354,15 @@ cargoNdk {
             )
         )
     }
-    // The default feature, "static", makes us use static linking for SDL2 and OpenAL Soft.
-    // For Android, we need dynamic linking for SDL2, but static linking for OpenAL Soft.
-    extraCargoBuildArguments = arrayListOf(
-        "--lib",
-        "--no-default-features",
-        "--features",
-        "touchHLE_openal_soft_wrapper/static,sdl2/bundled"
-    )
+    return env
+}
+
+// The only Java left in this module is SDL's vendored Android glue
+// (vendor/SDL/android-project), which uses some deprecated Android APIs.
+// We don't patch third-party code, so hide javac's "uses or overrides a
+// deprecated API" note instead. Our own code is Kotlin and still warns.
+tasks.withType<JavaCompile>().configureEach {
+    options.compilerArgs.add("-XDsuppressNotes")
 }
 
 dependencies {

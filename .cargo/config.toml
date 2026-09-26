@@ -2,3 +2,8 @@
 # the documentation for the touchHLE crate is intended to include private items
 # alas this isn't scoped to that crate!
 rustdocflags = ["--document-private-items"]
+
+[alias]
+# Build touchHLE and assemble a runnable Windows folder (see xtask/).
+dist-windows = "run --quiet --package xtask -- windows --release"
+debug-windows = "run --quiet --package xtask -- windows"

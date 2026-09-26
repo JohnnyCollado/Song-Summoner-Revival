@@ -40,6 +40,7 @@ pub struct Options {
     pub scale_hack: NonZeroU32,
     pub deadzone: f32,
     pub analog_stick_tilt_controls: bool,
+    pub virtual_cursor: bool,
     pub x_tilt_range: f32,
     pub y_tilt_range: f32,
     pub x_tilt_offset: f32,
@@ -48,21 +49,6 @@ pub struct Options {
     pub dpad_to_touch: Option<(f32, f32, f32, f32)>,
     pub stick_to_touch: Option<(f32, f32, f32, f32)>,
     pub stabilize_virtual_cursor: Option<(f32, f32)>,
-    /// If set, switches the virtual cursor from "absolute" mode (stick
-    /// position == on-screen cursor position) to "mouse-style" mode: the
-    /// stick deflection acts as a velocity (pixels per second at full
-    /// deflection), the cursor keeps its position when the stick is
-    /// released, and the cursor auto-hides after a short idle timeout.
-    /// Useful for menu-driven games where the player wants to release the
-    /// stick mid-decision without losing their cursor place.
-    pub mouse_style_cursor: Option<f32>,
-    /// If true, swap the role of the left and right analog sticks: the
-    /// **left** stick drives the virtual cursor and the **right** stick
-    /// drives the `--stick-to-touch` drag region. Useful for genres
-    /// (tactical RPGs, point-and-click) where the player's primary input
-    /// device is the cursor and they expect their dominant left thumb
-    /// on it.
-    pub swap_sticks: bool,
     pub gles1_implementation: Option<GLESImplementation>,
     pub direct_memory_access: bool,
     pub gdb_listen_addrs: Option<Vec<SocketAddr>>,
@@ -87,6 +73,7 @@ impl Default for Options {
             initial_orientation: DeviceOrientation::Portrait,
             scale_hack: NonZeroU32::new(1).unwrap(),
             analog_stick_tilt_controls: true,
+            virtual_cursor: true,
             deadzone: 0.1,
             x_tilt_range: 60.0,
             y_tilt_range: 60.0,
@@ -95,9 +82,7 @@ impl Default for Options {
             button_to_touch: HashMap::new(),
             dpad_to_touch: None,
             stick_to_touch: None,
-            swap_sticks: false,
             stabilize_virtual_cursor: None,
-            mouse_style_cursor: None,
             gles1_implementation: None,
             direct_memory_access: true,
             gdb_listen_addrs: None,
@@ -147,8 +132,8 @@ impl Options {
                 .map_err(|_| "Invalid scale hack factor".to_string())?;
         } else if arg == "--disable-analog-stick-tilt-controls" {
             self.analog_stick_tilt_controls = false;
-        } else if arg == "--swap-sticks" {
-            self.swap_sticks = true;
+        } else if arg == "--disable-virtual-cursor" {
+            self.virtual_cursor = false;
         } else if let Some(value) = arg.strip_prefix("--deadzone=") {
             self.deadzone = parse_degrees(value, "deadzone")?;
         } else if let Some(value) = arg.strip_prefix("--x-tilt-range=") {
@@ -225,13 +210,6 @@ impl Options {
                     "Invalid sticky radius for --stabilize-virtual-cursor=".to_string()
                 })?;
             self.stabilize_virtual_cursor = Some((smoothing_strength, sticky_radius));
-        } else if let Some(value) = arg.strip_prefix("--mouse-style-cursor=") {
-            let speed: f32 = value
-                .parse()
-                .ok()
-                .and_then(|s: f32| if s.is_finite() && s > 0.0 { Some(s) } else { None })
-                .ok_or_else(|| "Invalid speed for --mouse-style-cursor=".to_string())?;
-            self.mouse_style_cursor = Some(speed);
         } else if let Some(value) = arg.strip_prefix("--gles1=") {
             self.gles1_implementation = Some(
                 GLESImplementation::from_short_name(value)

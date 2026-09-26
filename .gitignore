@@ -100,6 +100,7 @@ android/app/src/songsummoner/assets/song_summoner.ipa
 # track the packaging script -- but the populated copies are bulky and
 # get re-generated on every refresh.
 /dist
+/debug
 /dist_windows
 /dist_wrapper
 

@@ -84,7 +84,7 @@ gradle installDebug
 
 #### Troubleshooting
 
-- Gradle build uses [cargo-ndk-plugin](https://github.com/willir/cargo-ndk-android-gradle) to build touchHLE lib automatically during Android build.
+- The Gradle build runs `cargo ndk` itself (the `buildCargoNdk<Variant>` tasks in `android/app/build.gradle.kts`) to build the touchHLE lib automatically during the Android build.
 If this step fails, try to debug first lib build only:
 
 ```

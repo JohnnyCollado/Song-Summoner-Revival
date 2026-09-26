@@ -28,14 +28,20 @@ pub fn main() {
                 .unwrap()
                 .trim_end()
                 .to_string();
-            if git_version
-                .strip_prefix('v')
-                .is_some_and(|v| !v.starts_with(&toml_version))
-                || !git_version.starts_with('v')
-            {
-                println!("cargo:warning=Cargo.toml version (v{toml_version}) is not a prefix of `git describe` version ({git_version})!");
+            match git_version.strip_prefix('v') {
+                Some(v) => {
+                    if !v.starts_with(&toml_version) {
+                        println!("cargo:warning=Cargo.toml version (v{toml_version}) is not a prefix of `git describe` version ({git_version})!");
+                    }
+                    git_version
+                }
+                // No version tag is reachable from HEAD (e.g. a fork that
+                // didn't fetch upstream's tags), so `git describe --always`
+                // gave a bare commit hash. That's expected rather than a
+                // mistake, so take the version from Cargo.toml and keep the
+                // hash for identification.
+                None => format!("v{toml_version} (git rev. {git_version})"),
             }
-            git_version
         }
         _ => {
             rerun_if_changed(&workspace_root.join("Cargo.toml"));

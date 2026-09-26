@@ -66,6 +66,12 @@ Game controller options:
         Note that touchHLE does not currently support accelerometers contained
         within game controllers.
 
+    --disable-virtual-cursor
+        Disables the virtual cursor that a game controller's right analog stick
+        normally moves (pressing the stick or the right shoulder button taps).
+        The --button-to-touch=, --dpad-to-touch= and --stick-to-touch= options
+        still work.
+
     --x-tilt-range=...
     --y-tilt-range=...
         Set the simulated rotation range of the device axis mapped to the analog
@@ -184,33 +190,6 @@ Game controller options:
         For example, --stabilize-virtual-cursor=0.1,10 will smooth out movements
         such that sharp movements take about half a second to complete, while
         movements within a 10px radius will be completely ignored.
-
-    --mouse-style-cursor=...
-        Switch the virtual cursor from absolute-position mode (the cursor's
-        on-screen position mirrors the stick deflection, and it snaps back to
-        the centre when the stick is released) to a mouse-style mode where
-        the stick acts as a velocity instead. The cursor moves at up to the
-        configured speed in pixels-per-second at full stick deflection,
-        keeps its on-screen position when the stick is released, and auto-
-        hides after a few seconds of inactivity.
-
-        For example, --mouse-style-cursor=800 lets the cursor cross an
-        ~800px screen in one second of full-deflection stick input. Best
-        suited to menu-driven games where the player needs to release the
-        stick to think without losing their place.
-
-    --swap-sticks
-        Swap the analog sticks' assignments. By default the RIGHT stick drives
-        the virtual cursor and the LEFT stick drives --stick-to-touch (or the
-        accelerometer-tilt simulator if --stick-to-touch isn't set). With this
-        flag, the LEFT stick drives the virtual cursor and the RIGHT stick
-        drives --stick-to-touch instead.
-
-        Useful for genres where the cursor is the primary input (tactical RPGs,
-        point-and-click games) and the player wants their dominant left thumb
-        on it. When the sticks are swapped, the cursor-tap signal is L-stick
-        click OR RightShoulder. LeftShoulder is deliberately excluded so you
-        can bind it via --button-to-touch without double-firing the cursor.
 
 Graphics driver options:
     --gles1=...

@@ -949,17 +949,6 @@ fn glGenTextures(env: &mut Environment, n: GLsizei, textures: MutPtr<GLuint>) {
         crate::frameworks::uikit::ui_view::ui_table_view::track_gl_textures_gen(&ids);
     }
 }
-/// Host-callable: delete a set of GL texture IDs via the currently-bound
-/// EAGL context. Used by the picker-swap cleanup to free leaked
-/// confirmation-panel textures between picks.
-pub fn host_delete_textures(env: &mut Environment, ids: &[u32]) {
-    if ids.is_empty() {
-        return;
-    }
-    with_ctx_and_mem(env, |gles, _mem| {
-        unsafe { gles.DeleteTextures(ids.len() as GLsizei, ids.as_ptr()) }
-    });
-}
 
 fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint>) {
     // INSTRUMENTATION: record IDs + caller LR for natural teardown

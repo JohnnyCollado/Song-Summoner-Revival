@@ -36,7 +36,8 @@ is bypassed). The scene stays alive with the counter parked at frame 31
 (idle).
 
 To trigger a fresh panel build on each pick, the picker-swap dispatch
-in `ui_view/ui_table_view.rs::force_panel_rebuild_predicate` writes:
+used to call `force_panel_rebuild_predicate` (since removed as unused
+ahead of a picker rewrite; see git history), which wrote:
 
 ```
 scene+0x00 = 0x0e   (scene type id)
@@ -103,8 +104,7 @@ guarantee of a clean fix.
 ## Files touched
 
 - `src/frameworks/uikit/ui_view/ui_table_view.rs` — promoted picker,
-  picker-swap dispatch, `force_panel_rebuild_predicate`, GL texture
-  tracker, scene observer.
+  picker-swap dispatch, GL texture tracker, scene observer.
 - `src/frameworks/uikit/ui_touch.rs` — button-area touch classifier,
   No/Back/Create Trooper routing.
 - `src/frameworks/foundation/ns_run_loop.rs` — per-tick scene observer

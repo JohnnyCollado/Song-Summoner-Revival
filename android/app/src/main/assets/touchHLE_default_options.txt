@@ -58,17 +58,7 @@ com.ea.spore.row.efigsj: --landscape-left --y-tilt-offset=35
 com.namconetworks.katamari: --landscape-left --stabilize-virtual-cursor=0.1,10 --y-tilt-offset=24 --button-to-touch=Start,240,15
 
 # Song Summoner: The Unsung Heroes Encore
-# Menu-driven RPG with no accelerometer use; --swap-sticks routes the LEFT
-# stick to the virtual cursor (primary input for menu/tile picking) and
-# the right stick to the camera/list drag region. --mouse-style-cursor
-# lets the cursor sit still while the player thinks. Coordinates calibrated
-# against the 480x320 landscape canvas:
-#   A = Confirm / advance dialog,     B = Back / wheel-cancel
-#   X = Skip cutscene,                Y = Next ally arrow
-#   LB = Prev ally arrow,             Start = Turn order / system pill
-#   D-pad + R-stick = battle camera drag / list scroll
-#   L-stick + L3 = free cursor + tap
-com.square-enix.SongSummonerEncore: --landscape-left --disable-analog-stick-tilt-controls --swap-sticks --mouse-style-cursor=800 --deadzone=0.15 --stabilize-virtual-cursor=0.10,8 --button-to-touch=A,240,165 --button-to-touch=B,245,110 --button-to-touch=X,455,47 --button-to-touch=Y,450,335 --button-to-touch=Start,45,50 --button-to-touch=LeftShoulder,35,335 --dpad-to-touch=60,80,360,200 --stick-to-touch=60,80,360,200
+com.square-enix.SongSummonerEncore: --landscape-left --disable-analog-stick-tilt-controls --disable-virtual-cursor
 
 # Wolfenstein RPG
 com.eamobile.wolfbv: --landscape-left --stabilize-virtual-cursor=0.1,10 --button-to-touch=A,240,160 --button-to-touch=B,240,280 --button-to-touch=X,26,280 --button-to-touch=Y,454,280 --button-to-touch=DPadLeft,34,178 --button-to-touch=DPadUp,76,140 --button-to-touch=DPadRight,116,180 --button-to-touch=DPadDown,76,220

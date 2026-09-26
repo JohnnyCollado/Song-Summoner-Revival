@@ -2,6 +2,8 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 [workspace]
+# Build helper for `cargo dist-windows` / `cargo debug-windows`.
+members = ["xtask"]
 
 [workspace.package]
 version = "0.2.3"
@@ -23,7 +25,12 @@ homepage = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "touchHLE"
+# Not "touchHLE": on Windows the lib's cdylib (touchHLE.dll, only needed for
+# the Android .so) and the bin would both write touchHLE.pdb, which Cargo
+# warns about (rust-lang/cargo#6313). Renaming the lib instead would change
+# the module_path!() prefix on every log line and the Android library name.
+# `cargo dist-windows` ships this as touchHLE.exe.
+name = "touchHLE_bin"
 path = "src/bin.rs"
 
 [features]

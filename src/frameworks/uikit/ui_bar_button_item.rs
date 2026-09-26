@@ -8,7 +8,7 @@
 
 use crate::frameworks::foundation::NSInteger;
 use crate::objc::{
-    id, msg, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr, SEL,
+    id, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr, SEL,
 };
 
 type UIBarButtonItemStyle = NSInteger;

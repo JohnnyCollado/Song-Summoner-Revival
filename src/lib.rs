@@ -40,7 +40,6 @@ mod fs;
 mod gdb;
 mod gles;
 mod image;
-mod input;
 mod libc;
 mod licenses;
 mod mach_o;

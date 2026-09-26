@@ -152,7 +152,6 @@ pub fn observe_ipod_scene_tick(env: &mut crate::Environment) {
         ipod_music_id_hi,
         tick,
     };
-    let interesting = matches!(scene_state, 2 | 3 | 5 | 6 | 9 | 15 | 30 | 31);
     let changed = match *g {
         None => true,
         Some(prev) => {
@@ -252,11 +251,10 @@ pub fn observe_ipod_scene_tick(env: &mut crate::Environment) {
 /// rebuilds on pick 2+ generate fresh textures WITHOUT deleting the old
 /// ones — that's the leak driving the visible duplication.
 ///
-/// We tag each gen call with the current "generation" (incremented by
-/// `bump_picker_generation()` on each picker-swap dispatch). On delete,
-/// we log which generation the freed texture came from. After a few
-/// picks: textures from gen 0 that are still alive when gen 2 is gen'ing
-/// new ones = the leaked panel sprites.
+/// We tag each gen call with the current "generation" and, on delete, log
+/// which generation the freed texture came from. Nothing advances the
+/// generation any more (the picker-swap hook that did was removed), so
+/// everything lands in gen 0 and this is now plain gen/delete logging.
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 
@@ -267,8 +265,6 @@ struct GlTextureTracker {
     /// Counts per-generation: how many gen'd, how many deleted.
     gen_count: HashMap<u32, (u32, u32)>,
     /// Per-generation set of texture IDs still alive from that gen.
-    /// Used by `take_prev_gen_ids_for_cleanup()` to harvest the leaked
-    /// confirmation-panel textures from prior picker cycles.
     gen_live: HashMap<u32, Vec<u32>>,
 }
 
@@ -330,89 +326,6 @@ pub fn track_gl_textures_delete(ids: &[u32]) {
     );
 }
 
-/// Harvest all GL texture IDs still alive from generations 1..current_gen.
-/// Gen 0 is excluded — those are setup textures for the picker / library
-/// that we must not free. Returns the IDs and removes them from our
-/// tracker (caller will pass them to glDeleteTextures).
-pub fn take_prev_gen_panel_textures() -> Vec<u32> {
-    let mut g = GL_TRACKER.lock().unwrap();
-    ensure_tracker(&mut g);
-    let t = g.as_mut().unwrap();
-    let current = t.current_generation;
-    let mut ids = Vec::new();
-    let gens_to_clean: Vec<u32> = t.gen_live.keys()
-        .copied()
-        .filter(|&gen| gen > 0 && gen < current)
-        .collect();
-    for gen in gens_to_clean {
-        if let Some(v) = t.gen_live.remove(&gen) {
-            for id in &v {
-                t.live.remove(id);
-            }
-            ids.extend(v);
-        }
-    }
-    ids
-}
-
-/// Mark a new picker-swap generation. Call from the dispatch in the
-/// touch handler so we can correlate texture lifecycle with picks.
-pub fn bump_picker_generation() {
-    let mut g = GL_TRACKER.lock().unwrap();
-    ensure_tracker(&mut g);
-    let t = g.as_mut().unwrap();
-    t.current_generation += 1;
-    let live_count = t.live.len();
-    // Dump per-generation counts so far.
-    let mut counts: Vec<(u32, (u32, u32))> = t.gen_count.iter().map(|(k, v)| (*k, *v)).collect();
-    counts.sort_by_key(|(k, _)| *k);
-    log!(
-        "[gl_tex] === PICKER GENERATION {} starts | live total={} | per-gen (gen, gen'd, del'd)={:?}",
-        t.current_generation, live_count, counts
-    );
-}
-
-/// Surgical iPod-scene sprite cleanup.
-///
-/// The iPod scene struct at entry 5 stores indices into the global 1024-
-/// entry render-object array (the same one 0xd2c8 iterates). Indices live
-/// at scene+0x10 through scene+0x3c. Non-(-1) non-0 values are live entry
-/// IDs whose backing texture refs need releasing.
-///
-/// We call destroy_at_index (game function 0xc708) on each, which:
-///   - clears the entry's status flag
-///   - decrements its texture refcount via release_texture_ref (0xd290)
-///   - calls glDeleteTextures(1, &id) when refcount hits 0
-///
-/// Then we write -1 to each cleared slot so the scene's own cleanup pass
-/// (which runs every frame after counter > 5) sees them as already gone.
-///
-/// This is the same cleanup the render function at 0x17800 does one slot
-/// per frame after counter > 5 — we just do all slots in one go before
-/// the next pick rebuilds the panel.
-/// Call the game's "destroy all render-pool entries" sweep at 0xd2c8.
-///
-/// This is the same function that runs during natural scene teardown
-/// (verified in earlier logs: a Back→re-enter cycle triggered a burst of
-/// glDeleteTextures that came through this path). It iterates all 1024
-/// entries in the global render-object array and calls release_texture_ref
-/// on each that has a non-zero status field.
-///
-/// Risk: this is GLOBAL — it'll also free non-iPod-scene sprites if any
-/// are alive (picker buttons, background, etc.). On a real device the
-/// natural teardown is OK because it happens during a scene transition
-/// when the picker is being torn down anyway. We're calling it mid-picker
-/// session, so anything else live in the pool will get its texture
-/// released too. If the picker re-creates its own sprites on the next
-/// frame, this is fine. If not, picker visuals will break.
-pub fn invoke_destroy_all_render_entries(env: &mut crate::Environment) {
-    use crate::abi::{CallFromHost, GuestFunction};
-    let destroy_all = GuestFunction::from_addr_and_thumb_flag(0xd2c8, true);
-    log!("invoke_destroy_all_render_entries: calling 0xd2c8 (global sweep)");
-    let _: () = destroy_all.call_from_host(env, ());
-    log!("invoke_destroy_all_render_entries: 0xd2c8 returned");
-}
-
 pub fn invoke_ipodview_reset(env: &mut crate::Environment) {
     const IPODVIEW_GLOBAL: u32 = 0xc7890;
     let mut before = [0u32; 16];
@@ -436,46 +349,6 @@ pub fn invoke_ipodview_reset(env: &mut crate::Environment) {
         before[8], before[9], before[10], before[11], before[12], before[13], before[14], before[15],
         after[0], after[1], after[2], after[3], after[4], after[5], after[6], after[7],
         after[8], after[9], after[10], after[11], after[12], after[13], after[14], after[15],
-    );
-}
-
-pub fn force_panel_rebuild_predicate(env: &mut crate::Environment) {
-    const SCENE_TABLE_BASE: u32 = 0x1134f0;
-    const ENTRY5_SCENE_PTR_VM: u32 = SCENE_TABLE_BASE + 5 * 0x1c + 0x18;
-    let sp: crate::mem::ConstPtr<u32> = crate::mem::Ptr::from_bits(ENTRY5_SCENE_PTR_VM);
-    let scene_ptr: u32 = env.mem.read(sp);
-    if scene_ptr == 0 {
-        log!("force_panel_rebuild_predicate: entry5 scene_ptr is null; skipping");
-        return;
-    }
-    let p00: crate::mem::ConstPtr<u32> = crate::mem::Ptr::from_bits(scene_ptr + 0x00);
-    let p04: crate::mem::ConstPtr<u32> = crate::mem::Ptr::from_bits(scene_ptr + 0x04);
-    let p08: crate::mem::ConstPtr<u32> = crate::mem::Ptr::from_bits(scene_ptr + 0x08);
-    let p0c: crate::mem::ConstPtr<u32> = crate::mem::Ptr::from_bits(scene_ptr + 0x0c);
-    let before_00 = env.mem.read(p00);
-    let before_04 = env.mem.read(p04);
-    let before_08 = env.mem.read(p08);
-    let before_0c = env.mem.read(p0c);
-    let w00: crate::mem::MutPtr<u32> = crate::mem::Ptr::from_bits(scene_ptr + 0x00);
-    let w08: crate::mem::MutPtr<u32> = crate::mem::Ptr::from_bits(scene_ptr + 0x08);
-    let w0c: crate::mem::MutPtr<u32> = crate::mem::Ptr::from_bits(scene_ptr + 0x0c);
-    env.mem.write(w00, 0x0eu32);
-    env.mem.write(w08, 3u32);
-    // EXPERIMENT: write +0x0c = 0 (counter reset, fresh-scene-like start)
-    // instead of 6 (rewind-from-idle to build keyframe). The fresh scene
-    // 0x30022bd0 was observed at counter=1 just after construction and
-    // fired +songsQuery at counter=3. Fresh-scene init path likely
-    // includes sprite-list reset that the rewind-to-6 path skips. By
-    // writing 0, the counter starts over and naturally hits frames
-    // 1, 2, 3 — invoking the same keyframe handlers that brand-new
-    // scenes execute.
-    env.mem.write(w0c, 0u32);
-    let after_00 = env.mem.read(p00);
-    let after_08 = env.mem.read(p08);
-    let after_0c = env.mem.read(p0c);
-    log!(
-        "force_panel_rebuild_predicate: scene={:#x} BEFORE +0x00={:#x} +0x04={:#x} +0x08={} +0x0c={} AFTER +0x00={:#x} +0x08={} +0x0c={}",
-        scene_ptr, before_00, before_04, before_08, before_0c, after_00, after_08, after_0c
     );
 }
 
@@ -551,48 +424,8 @@ pub fn snapshot_panel_views(env: &mut crate::Environment, phase: &str) {
     }
 }
 
-/// Recursively walk the keyWindow's view tree and return the first view
-/// whose class name matches `class_name`. Returns nil if not found.
-/// Used to locate the iPodView2 instance for picker-swap dispatch when the
-/// IPDSongsTab early-exits its didSelectRow on pick 2+.
-fn find_view_by_class(env: &mut crate::Environment, class_name: &str) -> id {
-    let app: id = msg_class![env; UIApplication sharedApplication];
-    let window: id = msg![env; app keyWindow];
-    if window == nil {
-        return nil;
-    }
-    let mut stack: Vec<id> = vec![window];
-    while let Some(v) = stack.pop() {
-        if v == nil || env.objc.get_host_object(v).is_none() {
-            continue;
-        }
-        let cls: crate::objc::Class = msg![env; v class];
-        if env.objc.get_class_name(cls) == class_name {
-            return v;
-        }
-        let subviews: id = msg![env; v subviews];
-        if subviews != nil {
-            let n: crate::frameworks::foundation::NSUInteger =
-                msg![env; subviews count];
-            for i in 0..n {
-                let child: id = msg![env; subviews objectAtIndex:i];
-                if child != nil {
-                    stack.push(child);
-                }
-            }
-        }
-    }
-    nil
-}
-
 fn ss_color_bg_dark(env: &mut crate::Environment) -> id {
     msg_class![env; UIColor colorWithRed:0.039f32 green:0.118f32 blue:0.149f32 alpha:1.0f32]
-}
-fn ss_color_cell_bg(env: &mut crate::Environment) -> id {
-    msg_class![env; UIColor colorWithRed:0.063f32 green:0.157f32 blue:0.196f32 alpha:1.0f32]
-}
-fn ss_color_panel_bg(env: &mut crate::Environment) -> id {
-    msg_class![env; UIColor colorWithRed:0.094f32 green:0.196f32 blue:0.243f32 alpha:1.0f32]
 }
 fn ss_color_text_bright(env: &mut crate::Environment) -> id {
     msg_class![env; UIColor colorWithRed:0.553f32 green:0.898f32 blue:0.937f32 alpha:1.0f32]
@@ -600,15 +433,6 @@ fn ss_color_text_bright(env: &mut crate::Environment) -> id {
 fn ss_color_text_dim(env: &mut crate::Environment) -> id {
     msg_class![env; UIColor colorWithRed:0.349f32 green:0.612f32 blue:0.671f32 alpha:1.0f32]
 }
-fn ss_color_btn_primary(env: &mut crate::Environment) -> id {
-    // Highlighted-confirm tone — used for the "Y / Create" affirm button.
-    msg_class![env; UIColor colorWithRed:0.157f32 green:0.314f32 blue:0.376f32 alpha:1.0f32]
-}
-fn ss_color_btn_secondary(env: &mut crate::Environment) -> id {
-    // Dim-back tone — used for the "N / Cancel" button.
-    msg_class![env; UIColor colorWithRed:0.078f32 green:0.176f32 blue:0.220f32 alpha:1.0f32]
-}
-
 /// Pointer to the currently-promoted large UITableView (the Songs picker).
 /// Used to determine whether the synthetic tab bar should be visible: the
 /// bar is shown only while this table is still a direct subview of the key
@@ -730,74 +554,6 @@ pub fn remount_promoted_picker(env: &mut crate::Environment) -> bool {
         () = msg![env; window bringSubviewToFront:bar];
     }
     true
-}
-
-/// Pop the topmost view controller off the nav stack reachable through the
-/// captured IPDSongsTab. Used by ui_touch on a "No" tap to remove the
-/// confirmation VC that path A of IPDSongsTableVC.didSelectRow pushed on the
-/// previous pick — so the next pick can re-enter path A (which alloc+init+
-/// pushes a fresh VC, the only path that builds a refreshed panel).
-pub fn pop_confirmation_nav_vc(env: &mut crate::Environment) {
-    let ipd_songs_bits = *IPD_SONGS_TABLE.lock().unwrap();
-    let Some(bits) = ipd_songs_bits else {
-        log!("pop_confirmation_nav_vc: no IPD_SONGS_TABLE captured");
-        return;
-    };
-    let songs_table = crate::objc::id::from_bits(bits);
-    if env.objc.get_host_object(songs_table).is_none() {
-        log!("pop_confirmation_nav_vc: songs_table host gone");
-        return;
-    }
-    let songs_delegate: id = env
-        .objc
-        .borrow::<UITableViewHostObject>(songs_table)
-        .delegate;
-    if songs_delegate == nil || env.objc.get_host_object(songs_delegate).is_none() {
-        log!("pop_confirmation_nav_vc: songs_delegate nil/gone");
-        return;
-    }
-    let cls: crate::objc::Class = msg![env; songs_delegate class];
-    let cname = env.objc.get_class_name(cls).to_string();
-    let nav_sel: SEL = env
-        .objc
-        .register_host_selector("navigationController".to_string(), &mut env.mem);
-    let responds_nav: bool = msg![env; songs_delegate respondsToSelector:nav_sel];
-    let parent_sel: SEL = env
-        .objc
-        .register_host_selector("parentViewController".to_string(), &mut env.mem);
-    let responds_parent: bool = msg![env; songs_delegate respondsToSelector:parent_sel];
-    let nav: id = if responds_nav {
-        msg![env; songs_delegate navigationController]
-    } else {
-        nil
-    };
-    let parent: id = if responds_parent {
-        msg![env; songs_delegate parentViewController]
-    } else {
-        nil
-    };
-    log!(
-        "pop_confirmation_nav_vc: delegate={:?} class={} responds_nav={} nav={:?} responds_parent={} parent={:?}",
-        songs_delegate, cname, responds_nav, nav, responds_parent, parent
-    );
-    if nav != nil && env.objc.get_host_object(nav).is_some() {
-        log!("Picker-swap: popping nav VC (nav={:?})", nav);
-        let _: id = msg![env; nav popViewControllerAnimated:false];
-    } else if parent != nil && env.objc.get_host_object(parent).is_some() {
-        // Try the parent's nav controller as a fallback.
-        let parent_nav: id = if msg![env; parent respondsToSelector:nav_sel] {
-            msg![env; parent navigationController]
-        } else {
-            nil
-        };
-        if parent_nav != nil && env.objc.get_host_object(parent_nav).is_some() {
-            log!(
-                "Picker-swap: popping nav VC via parent (parent_nav={:?})",
-                parent_nav
-            );
-            let _: id = msg![env; parent_nav popViewControllerAnimated:false];
-        }
-    }
 }
 
 /// Drain the deferred picker-swap dispatch queued by the touch handler.
@@ -936,12 +692,9 @@ type UITableViewScrollPosition = NSInteger;
 
 const DEFAULT_ROW_HEIGHT: f32 = 44.0;
 
-// Tags identifying our synthetic Y/N pick-confirmation overlay views, used
-// so UIControl's touchesEnded hook can recognise them and route to the
-// pick-or-cancel handlers.
+// Tag identifying the synthetic pick-confirmation overlay panel, so
+// hide_pick_prompt can find it on the key window.
 const PICK_PROMPT_TAG: crate::frameworks::foundation::NSInteger = 0x71_C_71_C;
-const PICK_PROMPT_YES_TAG: crate::frameworks::foundation::NSInteger = 0x71_C_77;
-const PICK_PROMPT_NO_TAG: crate::frameworks::foundation::NSInteger = 0x71_C_44;
 
 /// Persistent ID of the song the user most recently tapped (and that the
 /// Y/N prompt is currently asking about). Read by the Y-button handler so
@@ -993,12 +746,6 @@ struct UITableViewHostObject {
     /// trooper-creation scene. A fresh table created by the next picker
     /// session has this flag default-false and promotes normally.
     permanently_dismissed: bool,
-    /// Row index of the last tap, for double-tap detection.
-    last_tap_row: Option<NSUInteger>,
-    /// Time of the last tap (as nanos since some Instant), for double-tap
-    /// detection. We store epoch-nanos instead of `Instant` so the struct
-    /// can keep its derived `Default` impl.
-    last_tap_time_nanos: u128,
 }
 impl_HostObject_with_superclass!(UITableViewHostObject);
 
@@ -1880,161 +1627,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 };
 
-/// Walk up the view hierarchy from `view` looking for a UIViewController
-/// whose class name contains "Picker" (Song Summoner's IPDMediaPickerController
-/// and Apple's MPMediaPickerController both fit). Returns nil if no such
-/// ancestor exists.
-/// Mount a "Create unit?" Y/N overlay panel on the key window with the
-/// staged song's title above two coloured UIControl buttons (tagged so the
-/// existing UIControl.touchesEnded hook can route them). Replaces any
-/// existing prompt so retapping a different song updates the title.
-pub(super) fn show_pick_prompt(env: &mut crate::Environment, window: id, song_title: String) {
-    use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
-    // If a prompt already exists, just update its title label and unhide it
-    // — don't tear down and rebuild. Rebuilding releases the old UIControl
-    // buttons; if a touch was mid-flight on them (common when tapping fast)
-    // the next dispatch hits freed memory and crashes with
-    // `borrow::<UIControlHostObject>(...): no such object`.
-    let existing: id = msg![env; window viewWithTag:PICK_PROMPT_TAG];
-    if existing != nil {
-        () = msg![env; existing setHidden:false];
-        () = msg![env; window bringSubviewToFront:existing];
-        // Update title text. We tagged the title with a child-position
-        // approach: it's the FIRST UILabel subview of the panel. Iterate
-        // subviews to find it.
-        let subs = env
-            .objc
-            .borrow::<super::UIViewHostObject>(existing)
-            .subviews
-            .clone();
-        let label_cls = env.objc.get_known_class("UILabel", &mut env.mem);
-        for sub in subs {
-            if env.objc.get_host_object(sub).is_none() {
-                continue;
-            }
-            let is_label: bool = msg![env; sub isKindOfClass:label_cls];
-            if is_label {
-                let prompt_text = format!("Create unit from: {}?", song_title);
-                let title_ns =
-                    crate::frameworks::foundation::ns_string::from_rust_string(env, prompt_text);
-                () = msg![env; sub setText:title_ns];
-                release(env, title_ns);
-                break;
-            }
-        }
-        return;
-    }
-
-    // Place the panel along the iOS-right edge (= SDL top in landscape-left
-    // rotation) so it doesn't overlap the visible song list along the SDL
-    // bottom. Then rotate it the same +π/2 the picker uses so its labels
-    // read horizontally on screen.
-    let panel_frame = CGRect {
-        origin: CGPoint { x: 260.0, y: 60.0 },
-        size: CGSize { width: 60.0, height: 360.0 },
-    };
-    let panel: id = msg_class![env; UIView alloc];
-    let panel: id = msg![env; panel initWithFrame:panel_frame];
-    () = msg![env; panel setTag:PICK_PROMPT_TAG];
-    let bg: id = ss_color_panel_bg(env);
-    () = msg![env; panel setBackgroundColor:bg];
-    let transform = CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2);
-    () = msg![env; panel setTransform:transform];
-    () = msg![env; panel setFrame:panel_frame];
-
-    // Internal layout uses the panel's *post-rotation* local coords —
-    // labels stack horizontally on screen because the transform converts
-    // iOS-portrait Y into SDL-landscape X.
-    let panel_w = 360.0_f32;
-    let panel_h = 60.0_f32;
-
-    // Title label across the top half.
-    let title_frame = CGRect {
-        origin: CGPoint { x: 8.0, y: 4.0 },
-        size: CGSize { width: panel_w - 16.0, height: 22.0 },
-    };
-    let title_lbl: id = msg_class![env; UILabel alloc];
-    let title_lbl: id = msg![env; title_lbl initWithFrame:title_frame];
-    let prompt_text = format!("Create unit from: {}?", song_title);
-    let title_ns =
-        crate::frameworks::foundation::ns_string::from_rust_string(env, prompt_text);
-    () = msg![env; title_lbl setText:title_ns];
-    release(env, title_ns);
-    let title_color: id = ss_color_text_bright(env);
-    () = msg![env; title_lbl setTextColor:title_color];
-    let clear: id = msg_class![env; UIColor clearColor];
-    () = msg![env; title_lbl setBackgroundColor:clear];
-    () = msg![env; panel addSubview:title_lbl];
-    release(env, title_lbl);
-
-    // "Y" button (left half of bottom row). Slightly lighter teal so the
-    // confirm action reads as the highlighted option, in line with how the
-    // game styles its "Create Trooper" button vs the dimmer "No" button.
-    let btn_y = 30.0_f32;
-    let btn_h = panel_h - btn_y - 4.0;
-    let y_frame = CGRect {
-        origin: CGPoint { x: 8.0, y: btn_y },
-        size: CGSize { width: panel_w / 2.0 - 16.0, height: btn_h },
-    };
-    let y_btn: id = msg_class![env; UIControl alloc];
-    let y_btn: id = msg![env; y_btn initWithFrame:y_frame];
-    () = msg![env; y_btn setTag:PICK_PROMPT_YES_TAG];
-    let y_bg: id = ss_color_btn_primary(env);
-    () = msg![env; y_btn setBackgroundColor:y_bg];
-    () = msg![env; panel addSubview:y_btn];
-
-    let y_lbl_frame = CGRect {
-        origin: CGPoint { x: 0.0, y: 0.0 },
-        size: y_frame.size,
-    };
-    let y_lbl: id = msg_class![env; UILabel alloc];
-    let y_lbl: id = msg![env; y_lbl initWithFrame:y_lbl_frame];
-    let y_text = crate::frameworks::foundation::ns_string::from_rust_string(
-        env,
-        "Y — Create".to_string(),
-    );
-    () = msg![env; y_lbl setText:y_text];
-    release(env, y_text);
-    let btn_text_color: id = ss_color_text_bright(env);
-    () = msg![env; y_lbl setTextColor:btn_text_color];
-    () = msg![env; y_lbl setBackgroundColor:clear];
-    () = msg![env; y_lbl setTextAlignment:1i32];
-    () = msg![env; y_btn addSubview:y_lbl];
-    release(env, y_lbl);
-    release(env, y_btn);
-
-    // "N" button (right half).
-    let n_frame = CGRect {
-        origin: CGPoint { x: panel_w / 2.0 + 8.0, y: btn_y },
-        size: CGSize { width: panel_w / 2.0 - 16.0, height: btn_h },
-    };
-    let n_btn: id = msg_class![env; UIControl alloc];
-    let n_btn: id = msg![env; n_btn initWithFrame:n_frame];
-    () = msg![env; n_btn setTag:PICK_PROMPT_NO_TAG];
-    let n_bg: id = ss_color_btn_secondary(env);
-    () = msg![env; n_btn setBackgroundColor:n_bg];
-    () = msg![env; panel addSubview:n_btn];
-
-    let n_lbl: id = msg_class![env; UILabel alloc];
-    let n_lbl: id = msg![env; n_lbl initWithFrame:y_lbl_frame];
-    let n_text = crate::frameworks::foundation::ns_string::from_rust_string(
-        env,
-        "N — Cancel".to_string(),
-    );
-    () = msg![env; n_lbl setText:n_text];
-    release(env, n_text);
-    () = msg![env; n_lbl setTextColor:btn_text_color];
-    () = msg![env; n_lbl setBackgroundColor:clear];
-    () = msg![env; n_lbl setTextAlignment:1i32];
-    () = msg![env; n_btn addSubview:n_lbl];
-    release(env, n_lbl);
-    release(env, n_btn);
-
-    () = msg![env; window addSubview:panel];
-    () = msg![env; window bringSubviewToFront:panel];
-    release(env, panel);
-}
-
 pub(super) fn hide_pick_prompt(env: &mut crate::Environment, window: id) {
     // Hide rather than remove — keeping the panel and its UIControl buttons
     // in the view tree means a touch dispatched into them right before the
@@ -2125,73 +1717,6 @@ fn collect_window_view_controllers(env: &mut crate::Environment) -> Vec<id> {
     out
 }
 
-/// First walk up the superview chain from `view`; if no picker view-controller
-/// is found there, fall back to a depth-first scan of the whole window tree.
-/// Returns the picker view controller (any UIViewController whose class name
-/// contains "Picker") or nil.
-fn find_ancestor_picker(env: &mut crate::Environment, view: id) -> id {
-    // 1) Walk superviews — the cheap case (only works if the table is still
-    //    in the game's original view hierarchy, not after our reparent hack).
-    let mut current = view;
-    while current != nil {
-        let vc = env
-            .objc
-            .borrow::<super::UIViewHostObject>(current)
-            .view_controller;
-        if vc != nil {
-            let cls: crate::objc::Class = msg![env; vc class];
-            let name = env.objc.get_class_name(cls).to_string();
-            if name.contains("Picker") {
-                return vc;
-            }
-        }
-        let next: id = msg![env; current superview];
-        if next == current {
-            break;
-        }
-        current = next;
-    }
-    // 2) Fall back: DFS through the whole window tree. After the promoted-
-    //    table reparent the picker controller is no longer an ancestor of
-    //    the visible table, but it still exists somewhere in the window
-    //    subtree of the original picker views.
-    let app: id = msg_class![env; UIApplication sharedApplication];
-    let window: id = msg![env; app keyWindow];
-    if window == nil {
-        return nil;
-    }
-    let mut stack: Vec<id> = vec![window];
-    let mut seen_vcs: Vec<String> = Vec::new();
-    while let Some(v) = stack.pop() {
-        let vc = env.objc.borrow::<super::UIViewHostObject>(v).view_controller;
-        if vc != nil {
-            let cls: crate::objc::Class = msg![env; vc class];
-            let name = env.objc.get_class_name(cls).to_string();
-            seen_vcs.push(name.clone());
-            if name.contains("Picker")
-                || name.contains("iPod")
-                || name.contains("Media")
-                || name == "IPDController"
-            {
-                return vc;
-            }
-        }
-        let subviews = env
-            .objc
-            .borrow::<super::UIViewHostObject>(v)
-            .subviews
-            .clone();
-        for sub in subviews {
-            stack.push(sub);
-        }
-    }
-    log!(
-        "find_ancestor_picker DFS: no picker. view-controller classes seen: {:?}",
-        seen_vcs
-    );
-    nil
-}
-
 /// Lazily load `res/album_placeholder.png` (relative to the current working
 /// directory) into a UIImage and cache the result. Returns `nil` if the file
 /// is missing or undecodable; callers fall back to a coloured swatch.
@@ -2249,100 +1774,11 @@ fn get_or_load_placeholder_image(env: &mut crate::Environment) -> id {
     img
 }
 
-/// Render a synthetic iPod-style tab bar on top of the given window. Used by
-/// the picker-promotion hack to give the user a visual "you are on the Songs
-/// tab" indicator even though Song Summoner's picker doesn't draw any tab
-/// chrome of its own. Idempotent — checks for an existing tag-marked tab bar
-/// and skips re-creation.
-fn build_synthetic_tab_bar(_env: &mut crate::Environment, _window: id) {
-    // Disabled — the synthetic Playlists/Artists/Albums/Songs strip was
-    // purely decorative (we don't handle taps on its tabs) and it was
-    // covering the game's own bottom-right back button. Kept the function
-    // around as a no-op so other call sites don't break.
-    #[allow(unreachable_code)]
-    { return; }
-    use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
-    let env = _env;
-    let window = _window;
-    const TAB_BAR_TAG: crate::frameworks::foundation::NSInteger = 0x7AB_BA;
-
-    // If a tab bar already exists, just bring it to the front so it stays
-    // above any newly-reparented tables.
-    let existing: id = msg![env; window viewWithTag:TAB_BAR_TAG];
-    if existing != nil {
-        () = msg![env; window bringSubviewToFront:existing];
-        return;
-    }
-
-    // Place the tab bar along the bottom edge of the SDL landscape display.
-    // Empirically (verified in the LandscapeLeft screenshot): iOS portrait
-    // x=high lands at SDL *top*, x=low lands at SDL *bottom*. So a 50pt-wide
-    // strip on the iOS left edge (x=0..50) becomes a 50pt-tall bar at SDL
-    // bottom under the -π/2 rotation.
-    let bar_view: id = msg_class![env; UIView alloc];
-    // Height is in iOS-portrait coords = landscape width post-rotation.
-    // Leave a 50px slice on the right of the landscape screen so the
-    // game's bottom-right back button stays uncovered.
-    const BAR_LANDSCAPE_WIDTH: f32 = 480.0 - 50.0;
-    let bar_frame = CGRect {
-        origin: CGPoint { x: 0.0, y: 0.0 },
-        size: CGSize { width: 50.0, height: BAR_LANDSCAPE_WIDTH },
-    };
-    let bar_view: id = msg![env; bar_view initWithFrame:bar_frame];
-    () = msg![env; bar_view setTag:TAB_BAR_TAG];
-    // Slightly raised dark teal so the bar is visually distinct from the
-    // table above while matching the HUD palette.
-    let bar_bg: id = ss_color_panel_bg(env);
-    () = msg![env; bar_view setBackgroundColor:bar_bg];
-
-    // Counter-rotate by +π/2 so the labels inside the bar read left-to-right
-    // on the SDL display (matching the table). Same convention used by
-    // UITableView's initWithFrame.
-    let transform = CGAffineTransform::make_rotation(std::f32::consts::FRAC_PI_2);
-    () = msg![env; bar_view setTransform:transform];
-    () = msg![env; bar_view setFrame:bar_frame];
-
-    // Inside the bar's *local* coords (post-rotation it's a horizontal strip
-    // BAR_LANDSCAPE_WIDTH wide, 50 tall), drop in four labels evenly
-    // distributed across the shortened width.
-    let labels = ["Playlists", "Artists", "Albums", "Songs"];
-    let label_width = BAR_LANDSCAPE_WIDTH / labels.len() as f32;
-    for (i, name) in labels.iter().enumerate() {
-        let label_frame = CGRect {
-            origin: CGPoint {
-                x: (i as f32) * label_width,
-                y: 0.0,
-            },
-            size: CGSize {
-                width: label_width,
-                height: 50.0,
-            },
-        };
-        let lbl: id = msg_class![env; UILabel alloc];
-        let lbl: id = msg![env; lbl initWithFrame:label_frame];
-        let text_ns =
-            crate::frameworks::foundation::ns_string::from_rust_string(env, name.to_string());
-        () = msg![env; lbl setText:text_ns];
-        release(env, text_ns);
-        // Highlight "Songs" (the active tab) in bright cyan; dim others.
-        let color: id = if *name == "Songs" {
-            ss_color_text_bright(env)
-        } else {
-            ss_color_text_dim(env)
-        };
-        () = msg![env; lbl setTextColor:color];
-        let clear: id = msg_class![env; UIColor clearColor];
-        () = msg![env; lbl setBackgroundColor:clear];
-        // Center-align labels.
-        () = msg![env; lbl setTextAlignment:1i32]; // NSTextAlignmentCenter
-        () = msg![env; bar_view addSubview:lbl];
-        release(env, lbl);
-    }
-
-    () = msg![env; window addSubview:bar_view];
-    release(env, bar_view);
-    log!("Synthetic iPod tab bar mounted on window {:?}", window);
-}
+/// Formerly rendered a synthetic iPod-style Playlists/Artists/Albums/Songs
+/// tab bar over the promoted picker. Disabled: it was purely decorative (we
+/// didn't handle taps on its tabs) and covered the game's own bottom-right
+/// back button. Kept as a no-op so the promotion call sites stay unchanged.
+fn build_synthetic_tab_bar(_env: &mut crate::Environment, _window: id) {}
 
 /// Ensure exactly the cells in the current viewport (plus a small overscan)
 /// are instantiated. Releases cells that scrolled out of view and asks the

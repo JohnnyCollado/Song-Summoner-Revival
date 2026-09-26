@@ -188,7 +188,7 @@ fn run_test_app(
         sources.iter().chain(cpp_objects.iter()),
         extra_compile_args,
     )?;
-    let binary_name = "touchHLE";
+    let binary_name = "touchHLE_bin";
     let binary_path = target_dir().join(format!("{}{}", binary_name, env::consts::EXE_SUFFIX));
     let mut cmd = Command::new(binary_path);
     let output = cmd
@@ -272,7 +272,7 @@ fn test_app() -> Result<(), Box<dyn Error>> {
     let symbols_path = stubs_dir.join("SYMBOLS.txt");
     let dump_file_option = format!("--dump-file={}", symbols_path.to_str().unwrap());
     let dump_run_args = ["--dump=symbols", dump_file_option.as_str(), "--headless"];
-    let binary_name = "touchHLE";
+    let binary_name = "touchHLE_bin";
     let binary_path = target_dir().join(format!("{}{}", binary_name, env::consts::EXE_SUFFIX));
     let mut cmd = Command::new(binary_path);
     let output = cmd

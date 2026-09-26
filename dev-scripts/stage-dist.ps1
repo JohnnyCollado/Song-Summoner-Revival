@@ -6,7 +6,7 @@
 #   powershell -ExecutionPolicy Bypass -File dev-scripts\stage-dist.ps1
 #
 # Prereqs:
-#   - cargo build --release  (touchHLE.exe + touchHLE.dll in CARGO_TARGET_DIR)
+#   - cargo build --release  (touchHLE_bin.exe + touchHLE.dll in CARGO_TARGET_DIR)
 #   - android\gradlew :app:assembleSongsummonerRelease  (APK)
 # The script does NOT trigger builds itself — it just assembles artifacts.
 # If a source artifact is missing, the script reports which one and exits.
@@ -20,7 +20,7 @@ $winZip = Join-Path $dist 'SongSummoner-Windows-x86_64.zip'
 $apkOut = Join-Path $dist 'SongSummoner-Android-arm64.apk'
 
 $cargoTarget = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
-$srcExe = Join-Path $cargoTarget 'release\touchHLE.exe'
+$srcExe = Join-Path $cargoTarget 'release\touchHLE_bin.exe'
 $srcDll = Join-Path $cargoTarget 'release\touchHLE.dll'
 $srcApk = Join-Path $root 'android\app\build\outputs\apk\songsummoner\release\app-songsummoner-release.apk'
 
@@ -123,7 +123,7 @@ Write-Host "Writing README.html..."
   </thead>
   <tbody>
     <tr><td><code>SongSummoner-Windows-x86_64.zip</code></td><td>Windows 10/11 (x64)</td><td>—</td></tr>
-    <tr><td><code>SongSummoner-Android-arm64.apk</code></td><td>Android 5+ ARM64</td><td><code>org.touchhle.android.songsummoner</code></td></tr>
+    <tr><td><code>SongSummoner-Android-arm64.apk</code></td><td>Android 5+ ARM64</td><td><code>com.sqefam.songsummoner</code></td></tr>
   </tbody>
 </table>
 
