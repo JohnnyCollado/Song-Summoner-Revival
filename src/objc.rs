@@ -53,7 +53,7 @@ use classes::{
 };
 pub(crate) use messages::objc_msgSend;
 use messages::{objc_msgSendSuper2, objc_msgSend_stret, MsgSendSignature, MsgSendSuperSignature};
-use methods::method_list_t;
+use methods::{method_list_t, GuestIMP};
 use objects::{objc_object, object_getClass, HostObjectEntry};
 use properties::{ivar_list_t, objc_copyStruct, objc_getProperty, objc_setProperty};
 use selectors::sel_registerName;
@@ -90,6 +90,11 @@ pub struct ObjC {
     /// Type information isn't part of the `objc_msgSend` ABI, so an alternative
     /// channel is needed.
     message_type_info: Option<(std::any::TypeId, &'static str)>,
+
+    /// The app's own methods that app overrides replaced, by class name and
+    /// selector, so an override can wrap rather than replace
+    /// (see [ObjC::app_override_original]).
+    app_override_originals: HashMap<(String, String), GuestIMP>,
 }
 
 impl ObjC {
@@ -101,6 +106,7 @@ impl ObjC {
             sync_mutexes: HashMap::new(),
             initializer_threads: HashMap::new(),
             message_type_info: None,
+            app_override_originals: HashMap::new(),
         }
     }
 }

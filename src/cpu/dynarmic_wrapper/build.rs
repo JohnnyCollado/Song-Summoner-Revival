@@ -16,14 +16,28 @@ fn link_lib(lib: &str) {
     println!("cargo:rustc-link-lib=static={lib}");
 }
 
+/// The CMake build type, from the same rule the cmake crate uses (opt-level
+/// 0 is Debug, otherwise Release, or RelWithDebInfo with debug info). It's
+/// set explicitly and reused below, because the library names and folders
+/// depend on it: debug builds use `[profile.dev] opt-level = 1`, so a
+/// debug-assertions build is RelWithDebInfo, not Debug, and fmt only adds
+/// its "d" suffix for Debug.
+fn cmake_build_type() -> &'static str {
+    let opt_level = env::var("OPT_LEVEL").expect("OPT_LEVEL was not set");
+    let debug_info = env::var("DEBUG").map_or(true, |debug| debug != "false");
+    match (opt_level.as_str(), debug_info) {
+        ("0", _) => "Debug",
+        (_, false) => "Release",
+        (_, true) => "RelWithDebInfo",
+    }
+}
+
+/// The per-configuration subfolder Visual Studio's multi-config generator
+/// puts libraries in. Other platforms' generators don't use one.
 fn build_type_windows() -> &'static str {
     let os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS was not set");
     if os.eq_ignore_ascii_case("windows") {
-        if cfg!(debug_assertions) {
-            "Debug"
-        } else {
-            "Release"
-        }
+        cmake_build_type()
     } else {
         ""
     }
@@ -39,6 +53,7 @@ fn main() {
     build.define("DYNARMIC_TESTS", "OFF");
     build.define("DYNARMIC_USE_BUNDLED_EXTERNALS", "ON");
     build.define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
+    build.profile(cmake_build_type());
 
     // This is Windows- and Android-specific because on macOS or Linux, you can
     // easily get Boost with a package manager.
@@ -99,7 +114,7 @@ fn main() {
             .join("build/externals/fmt")
             .join(build_type_windows()),
     );
-    link_lib(if cfg!(debug_assertions) {
+    link_lib(if cmake_build_type() == "Debug" {
         "fmtd"
     } else {
         "fmt"

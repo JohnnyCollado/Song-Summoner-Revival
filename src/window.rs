@@ -116,6 +116,39 @@ fn set_sdl2_orientation(orientation: DeviceOrientation) {
     );
 }
 
+/// A point in the window's app viewport (`(x, y, width, height)`, as
+/// [Window::viewport] gives) to the app's portrait screen space
+/// (`screen_size`, in points), undoing the rotation. This is how input is
+/// mapped.
+fn viewport_to_screen(
+    (in_x, in_y): (f32, f32),
+    (vx, vy, vw, vh): (u32, u32, u32, u32),
+    rotation: &Matrix<2>,
+    (out_w, out_h): (u32, u32),
+) -> (f32, f32) {
+    // normalize to unit square centred on origin
+    let x = (in_x - vx as f32) / vw as f32 - 0.5;
+    let y = (in_y - vy as f32) / vh as f32 - 0.5;
+    // rotate
+    let [x, y] = rotation.inverse().unwrap().transform([x, y]);
+    // back to pixels
+    ((x + 0.5) * out_w as f32, (y + 0.5) * out_h as f32)
+}
+
+/// The inverse of [viewport_to_screen]: where a point of the app's screen
+/// appears in the window. Used to draw over the app.
+fn screen_to_viewport(
+    (in_x, in_y): (f32, f32),
+    (vx, vy, vw, vh): (u32, u32, u32, u32),
+    rotation: &Matrix<2>,
+    (screen_w, screen_h): (u32, u32),
+) -> (f32, f32) {
+    let x = in_x / screen_w as f32 - 0.5;
+    let y = in_y / screen_h as f32 - 0.5;
+    let [x, y] = rotation.transform([x, y]);
+    (vx as f32 + (x + 0.5) * vw as f32, vy as f32 + (y + 0.5) * vh as f32)
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FingerId {
     Mouse,
@@ -133,6 +166,25 @@ struct DpadState {
     up: bool,
     down: bool,
     active: bool,
+}
+
+/// A game controller button, by position. SDL's button labels are turned
+/// off (see [Window::new]), so `FaceSouth` is the bottom face button on
+/// every pad, whatever is printed on it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PadButton {
+    FaceSouth,
+    FaceEast,
+    FaceWest,
+    FaceNorth,
+    DPadUp,
+    DPadDown,
+    DPadLeft,
+    DPadRight,
+    LeftShoulder,
+    RightShoulder,
+    Start,
+    Back,
 }
 
 #[derive(Debug)]
@@ -159,6 +211,16 @@ pub enum Event {
     /// take over.
     EnterDebugger,
     TextInput(TextInputEvent),
+    /// A controller button went down or up, for menus touchHLE draws itself
+    /// (the Song Summoner picker). Sent as well as, not instead of, any
+    /// `--button-to-touch=` style touch the button is mapped to.
+    ControllerButton {
+        button: PadButton,
+        pressed: bool,
+        /// `SDL_GameControllerType` of the pad it came from, for picking
+        /// which make's button icons to draw.
+        controller_type: u32,
+    },
 }
 
 pub enum BatteryState {
@@ -236,6 +298,10 @@ pub struct Window {
     accelerometer: Option<sdl2::sensor::Sensor>,
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
+    /// A rectangle (x, y, width, height, in the app's portrait screen
+    /// points) to outline over the app: the controller's focus in menus
+    /// that have none of their own (see [Self::set_focus_marker]).
+    focus_marker: Option<(f32, f32, f32, f32)>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
     /// Whether or not we are on the "main" environment stack (rather than
     /// a coroutine stack). Checked in various functions to make sure that
@@ -266,6 +332,13 @@ impl Window {
         // (https://github.com/libsdl-org/SDL/issues/7479). Once that's fixed,
         // remove this (https://github.com/touchHLE/touchHLE/issues/85).
         sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "0");
+
+        // Name buttons by position, not by the letter printed on them. By
+        // default SDL calls a Switch pad's right button "A" because that's
+        // its label, which puts it where an Xbox pad's B is. Positions keep
+        // the confirm/back buttons and their on-screen icons consistent
+        // across makes (see PadButton).
+        sdl2::hint::set("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0");
 
         if env::consts::OS == "android" {
             // It's important to set context version BEFORE window creation
@@ -392,6 +465,7 @@ impl Window {
             accelerometer,
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
+            focus_marker: None,
             virtual_accelerometer_last: None,
             on_main_stack: true,
         };
@@ -445,16 +519,12 @@ impl Window {
             } else {
                 window.viewport()
             };
-            // normalize to unit square centred on origin
-            let x = (in_x - vx as f32) / vw as f32 - 0.5;
-            let y = (in_y - vy as f32) / vh as f32 - 0.5;
-            // rotate
-            let matrix = window.rotation_matrix().inverse().unwrap();
-            let [x, y] = matrix.transform([x, y]);
-            // back to pixels
-            let (out_w, out_h) = window.size_unrotated_unscaled();
-            let out_x = (x + 0.5) * out_w as f32;
-            let out_y = (y + 0.5) * out_h as f32;
+            let (out_x, out_y) = viewport_to_screen(
+                (in_x, in_y),
+                (vx, vy, vw, vh),
+                &window.rotation_matrix(),
+                window.size_unrotated_unscaled(),
+            );
             // Round to match touch precision of official devices.
             (out_x.round(), out_y.round())
         }
@@ -479,6 +549,32 @@ impl Window {
                     Some(crate::options::Button::LeftShoulder)
                 }
                 _ => None,
+            }
+        }
+        fn translate_pad_button(button: sdl2::controller::Button) -> Option<PadButton> {
+            use sdl2::controller::Button as B;
+            Some(match button {
+                B::A => PadButton::FaceSouth,
+                B::B => PadButton::FaceEast,
+                B::X => PadButton::FaceWest,
+                B::Y => PadButton::FaceNorth,
+                B::DPadUp => PadButton::DPadUp,
+                B::DPadDown => PadButton::DPadDown,
+                B::DPadLeft => PadButton::DPadLeft,
+                B::DPadRight => PadButton::DPadRight,
+                B::LeftShoulder => PadButton::LeftShoulder,
+                B::RightShoulder => PadButton::RightShoulder,
+                B::Start => PadButton::Start,
+                B::Back => PadButton::Back,
+                _ => return None,
+            })
+        }
+        fn controller_type(instance_id: u32) -> u32 {
+            // SAFETY: SDL returns null for an unknown id, which
+            // SDL_GameControllerGetType treats as "unknown".
+            unsafe {
+                let controller = sdl2_sys::SDL_GameControllerFromInstanceID(instance_id as i32);
+                sdl2_sys::SDL_GameControllerGetType(controller) as u32
             }
         }
         fn finger_absolute_coords(window: &Window, (x, y): (f32, f32)) -> (f32, f32) {
@@ -534,6 +630,22 @@ impl Window {
                 } => {
                     let (x, y) = transform_virt_accel_coords(self, (x, y));
                     self.virtual_accelerometer_last = Some((x, y, false));
+                }
+                _ => {}
+            }
+
+            // Controller buttons for touchHLE's own menus. The touch
+            // mappings below still see the same event.
+            match event {
+                E::ControllerButtonDown { which, button, .. }
+                | E::ControllerButtonUp { which, button, .. } => {
+                    if let Some(button) = translate_pad_button(button) {
+                        self.event_queue.push_back(Event::ControllerButton {
+                            button,
+                            pressed: matches!(event, E::ControllerButtonDown { .. }),
+                            controller_type: controller_type(which),
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -1025,6 +1137,32 @@ impl Window {
         (x, y, z)
     }
 
+    /// Outline a rectangle of the app's screen (x, y, width, height, in
+    /// portrait screen points, as `-[UIView convertRect:toView:nil]` gives),
+    /// or stop. It stays until changed.
+    pub fn set_focus_marker(&mut self, rect: Option<(f32, f32, f32, f32)>) {
+        self.focus_marker = rect;
+    }
+
+    /// For use when redrawing the screen: where the focus marker is in the
+    /// window (x, y, width, height, in the same pixels as
+    /// [Self::virtual_cursor_visible_at]), if there is one.
+    pub fn focus_marker_visible_at(&self) -> Option<(f32, f32, f32, f32)> {
+        let (x, y, w, h) = self.focus_marker?;
+        let to_window = |p| {
+            screen_to_viewport(
+                p,
+                self.viewport(),
+                &self.rotation_matrix(),
+                self.size_unrotated_unscaled(),
+            )
+        };
+        // Rotations are by quarter turns, so opposite corners are enough.
+        let (x0, y0) = to_window((x, y));
+        let (x1, y1) = to_window((x + w, y + h));
+        Some((x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs()))
+    }
+
     /// For use when redrawing the screen: Get the cached on-screen position and
     /// press state of the analog stick-controlled virtual cursor, if it is
     /// visible.
@@ -1279,6 +1417,7 @@ impl Window {
                 viewport,
                 matrix,
                 /* virtual_cursor_visible_at: */ None,
+                /* focus_marker: */ None,
             );
 
             gl_ctx.DeleteTextures(1, &texture);
@@ -1573,4 +1712,39 @@ pub fn get_preferred_country_codes(env: &mut Environment) -> Vec<String> {
             .filter_map(|loc| loc.country)
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCREEN: (u32, u32) = (320, 480);
+
+    #[test]
+    fn screen_to_viewport_undoes_input_mapping() {
+        // A landscape window, letterboxed, for each orientation.
+        let viewport = (40, 10, 960, 640);
+        for rotation in [
+            Matrix::identity(),
+            Matrix::z_rotation(-FRAC_PI_2),
+            Matrix::z_rotation(FRAC_PI_2),
+        ] {
+            for point in [(0.0, 0.0), (320.0, 480.0), (100.0, 25.0), (160.0, 240.0)] {
+                let window = screen_to_viewport(point, viewport, &rotation, SCREEN);
+                let back = viewport_to_screen(window, viewport, &rotation, SCREEN);
+                assert!(
+                    (back.0 - point.0).abs() < 0.01 && (back.1 - point.1).abs() < 0.01,
+                    "{point:?} -> {window:?} -> {back:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn screen_centre_is_viewport_centre() {
+        let viewport = (40, 10, 960, 640);
+        let rotation = Matrix::z_rotation(-FRAC_PI_2);
+        let (x, y) = screen_to_viewport((160.0, 240.0), viewport, &rotation, SCREEN);
+        assert!((x - 520.0).abs() < 0.01 && (y - 330.0).abs() < 0.01, "{x} {y}");
+    }
 }

@@ -79,3 +79,10 @@ and is not affected.
 | `inspect/` | RE tools (`mo.py`, `ssdis.py`, `xref.py`) and `picker_mockup.py`, which renders the picker design from your own IPA into `debug/picker-mockup/`. |
 
 Building: see [`dev-docs/building.md`](dev-docs/building.md).
+
+## Credits
+
+Controller button icons: "Button Icons and Controls" by
+[Zacksly](https://zacksly.itch.io), licensed under
+[CC BY 3.0](http://creativecommons.org/licenses/by/3.0/). The files in
+`res/controller_glyphs/` are unmodified; see `CREDITS.txt` there.

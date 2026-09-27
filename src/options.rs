@@ -31,6 +31,18 @@ pub enum Button {
     LeftShoulder,
 }
 
+/// Which face button confirms in menus touchHLE draws itself (the Song
+/// Summoner picker). The other of the two goes back. By position, so it
+/// means the same button on every make of controller.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum ConfirmButton {
+    /// The bottom button (A on Xbox, Cross on PlayStation, B on Switch).
+    #[default]
+    South,
+    /// The right button (B on Xbox, Circle on PlayStation, A on Switch).
+    East,
+}
+
 /// Struct containing all user-configurable options.
 #[derive(Clone)]
 pub struct Options {
@@ -68,6 +80,7 @@ pub struct Options {
     pub music_library: bool,
     /// Ask for the music folder again even if one was chosen before.
     pub choose_music_folder: bool,
+    pub confirm_button: ConfirmButton,
 }
 
 impl Default for Options {
@@ -104,6 +117,7 @@ impl Default for Options {
             zero_stack_after_guest_to_host_call: None,
             music_library: false,
             choose_music_folder: false,
+            confirm_button: ConfirmButton::South,
         }
     }
 }
@@ -141,6 +155,12 @@ impl Options {
             self.analog_stick_tilt_controls = false;
         } else if arg == "--disable-virtual-cursor" {
             self.virtual_cursor = false;
+        } else if let Some(value) = arg.strip_prefix("--confirm-button=") {
+            self.confirm_button = match value {
+                "south" => ConfirmButton::South,
+                "east" => ConfirmButton::East,
+                _ => return Err("Value for --confirm-button= must be south or east".to_string()),
+            };
         } else if let Some(value) = arg.strip_prefix("--deadzone=") {
             self.deadzone = parse_degrees(value, "deadzone")?;
         } else if let Some(value) = arg.strip_prefix("--x-tilt-range=") {
@@ -347,4 +367,25 @@ fn parse_dump_options(options: &str) -> Result<DumpingOptions, String> {
         }
     }
     Ok(dumping_options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirm_button_defaults_to_south() {
+        assert_eq!(Options::default().confirm_button, ConfirmButton::South);
+    }
+
+    #[test]
+    fn confirm_button_option() {
+        let mut options = Options::default();
+        assert_eq!(options.parse_argument("--confirm-button=east"), Ok(true));
+        assert_eq!(options.confirm_button, ConfirmButton::East);
+        assert_eq!(options.parse_argument("--confirm-button=south"), Ok(true));
+        assert_eq!(options.confirm_button, ConfirmButton::South);
+        assert!(options.parse_argument("--confirm-button=A").is_err());
+        assert_eq!(options.confirm_button, ConfirmButton::South);
+    }
 }

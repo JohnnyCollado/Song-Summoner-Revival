@@ -1,0 +1,26 @@
+CONTROLLER BUTTON ICON ART: ATTRIBUTION
+=======================================
+
+The controller button icons in this folder (ctl_xb_*, ctl_ps_*, ctl_ns_*)
+come from Zacksly's button icon packs.
+
+  Author:   Zacksly
+  Website:  https://zacksly.itch.io
+  License:  Creative Commons Attribution 3.0 Unported (CC BY 3.0)
+            http://creativecommons.org/licenses/by/3.0/
+
+Packs used (all "Buttons Solid / White / 128w"):
+
+  - Xbox Series Button Icons and Controls  -> ctl_xb_*
+  - PS5 Button Icons and Controls          -> ctl_ps_*   (DualSense)
+  - Switch 2 Button Icons and Controls     -> ctl_ns_*
+
+Modifications: none to the files in this folder; they are byte-identical to
+the pack originals, renamed, and only the subset the game's prompts use is
+included. They are embedded in the touchHLE binary
+(src/frameworks/song_summoner/glyphs.rs) and shrunk at run time to the size
+the on-screen prompts draw them at.
+
+Credit line:
+
+  "Button Icons and Controls by Zacksly (CC BY 3.0 Licensed | zacksly.itch.io)"

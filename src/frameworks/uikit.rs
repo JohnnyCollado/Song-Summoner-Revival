@@ -118,9 +118,13 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 echo!("User requested quit, exiting.");
                 ui_application::exit(env);
             }
-            Event::TouchesDown(..) | Event::TouchesMove(..) | Event::TouchesUp(..) => {
+            Event::TouchesDown(..) => {
+                // Touch takes over from the controller in Song Summoner's
+                // menus (hides its focus). Nothing happens for other apps.
+                crate::frameworks::song_summoner::touch_used(env);
                 ui_touch::handle_event(env, event)
             }
+            Event::TouchesMove(..) | Event::TouchesUp(..) => ui_touch::handle_event(env, event),
             Event::AppWillResignActive => {
                 // Getting this event means touchHLE is becoming inactive, e.g.
                 // due to switching apps. The obvious way to handle this would
@@ -151,6 +155,20 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 } else {
                     log!("Ignoring EnterDebugger event: no debugger connected.");
                 }
+            }
+            Event::ControllerButton {
+                button,
+                pressed,
+                controller_type,
+            } => {
+                // Only Song Summoner's picker uses these so far. Without an
+                // open picker this does nothing.
+                crate::frameworks::song_summoner::handle_pad_button(
+                    env,
+                    button,
+                    pressed,
+                    controller_type,
+                );
             }
             Event::TextInput(text_event) => {
                 let responder = env.framework_state.uikit.ui_responder.first_responder;

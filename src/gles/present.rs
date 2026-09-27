@@ -41,7 +41,8 @@ impl FpsCounter {
 /// Present the the latest frame (e.g. the app's splash screen or rendering
 /// output), provided as a texture bound to `GL_TEXTURE_2D`, by drawing it on
 /// the window. It may be rotated, scaled and/or letterboxed as necessary. The
-/// virtual cursor is also drawn if it should be currently visible.
+/// virtual cursor is also drawn if it should be currently visible, and so is
+/// the focus marker (see [crate::window::Window::set_focus_marker]).
 ///
 /// The provided context must be current.
 pub unsafe fn present_frame(
@@ -49,6 +50,7 @@ pub unsafe fn present_frame(
     viewport: (u32, u32, u32, u32),
     rotation_matrix: Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
+    focus_marker: Option<(f32, f32, f32, f32)>,
 ) {
     // While this is a generic utility, it is closely tied to
     // crate::frameworks::opengles::eagl::present_renderbuffer, which handles
@@ -105,5 +107,40 @@ pub unsafe fn present_frame(
         }
         gles.VertexPointer(2, gles11::FLOAT, 0, vertices.as_ptr() as *const GLvoid);
         gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+    }
+
+    // Display the focus marker: a light tint over the rectangle, and a
+    // bright outline around it, a few pixels outside so it doesn't cover
+    // the button's own edge.
+    if let Some((x, y, w, h)) = focus_marker {
+        let (vx, vy, vw, vh) = viewport;
+        let (x, y) = (x - vx as f32, y - vy as f32);
+
+        gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
+        gles.Disable(gles11::TEXTURE_2D);
+        gles.Enable(gles11::BLEND);
+        gles.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
+
+        // Premultiplied alpha, like the cursor above.
+        let quad = |gles: &mut dyn GLES, x: f32, y: f32, w: f32, h: f32| {
+            let (x0, x1) = (x / (vw as f32 / 2.0) - 1.0, (x + w) / (vw as f32 / 2.0) - 1.0);
+            let (y0, y1) = (1.0 - y / (vh as f32 / 2.0), 1.0 - (y + h) / (vh as f32 / 2.0));
+            let quad: [f32; 12] = [x0, y0, x1, y0, x0, y1, x1, y0, x0, y1, x1, y1];
+            gles.VertexPointer(2, gles11::FLOAT, 0, quad.as_ptr() as *const GLvoid);
+            gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+        };
+        let tint = 0.12;
+        gles.Color4f(0.35 * tint, 0.78 * tint, tint, tint);
+        quad(gles, x, y, w, h);
+        // Thickness scales with the window, about 2 points of the app.
+        let t = (vw.min(vh) as f32 / 160.0).max(2.0);
+        let pad = t;
+        let (ox, oy, ow, oh) = (x - pad - t, y - pad - t, w + 2.0 * (pad + t), h + 2.0 * (pad + t));
+        gles.Color4f(0.35, 0.78, 1.0, 1.0);
+        quad(gles, ox, oy, ow, t);
+        quad(gles, ox, oy + oh - t, ow, t);
+        quad(gles, ox, oy, t, oh);
+        quad(gles, ox + ow - t, oy, t, oh);
+        gles.Color4f(1.0, 1.0, 1.0, 1.0);
     }
 }

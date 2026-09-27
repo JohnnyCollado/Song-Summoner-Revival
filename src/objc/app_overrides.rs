@@ -14,8 +14,11 @@
 //!
 //! Entries for classes the app doesn't define are skipped, so a table only
 //! ever affects the app it was written for.
+//!
+//! The app's replaced method is kept ([ObjC::app_override_original]), so an
+//! override can also wrap it: do something, then call the original.
 
-use super::{Class, ClassHostObject, HostIMP, ObjC, IMP};
+use super::{Class, ClassHostObject, GuestIMP, HostIMP, ObjC, IMP};
 use crate::mach_o::MachO;
 use crate::mem::{ConstPtr, Mem, Ptr};
 use std::collections::HashMap;
@@ -30,7 +33,10 @@ pub struct Override {
 }
 
 /// Every override table. Add new feature tables here.
-const TABLES: &[&[Override]] = &[crate::frameworks::song_summoner::OVERRIDES];
+const TABLES: &[&[Override]] = &[
+    crate::frameworks::song_summoner::OVERRIDES,
+    crate::frameworks::song_summoner::INPUT_OVERRIDES,
+];
 
 impl ObjC {
     /// For use by [crate::dyld], after the app's classes and categories are
@@ -89,11 +95,15 @@ impl ObjC {
                 }
             }
 
-            let had_method = self
+            let replaced = self
                 .borrow_mut::<ClassHostObject>(target)
                 .methods
-                .insert(sel, IMP::Host(entry.imp))
-                .is_some();
+                .insert(sel, IMP::Host(entry.imp));
+            let had_method = replaced.is_some();
+            if let Some(IMP::Guest(original)) = replaced {
+                self.app_override_originals
+                    .insert((entry.class.to_string(), entry.selector.to_string()), original);
+            }
             log!(
                 "objc: {}[{} {}] {} by a host implementation",
                 if entry.class_method { "+" } else { "-" },
@@ -102,6 +112,15 @@ impl ObjC {
                 if had_method { "replaced" } else { "added" }
             );
         }
+    }
+
+    /// The app's own implementation of a method an override replaced, for
+    /// overrides that wrap it. `None` if the app had none of its own (or the
+    /// override wasn't installed).
+    pub fn app_override_original(&self, class: &str, selector: &str) -> Option<GuestIMP> {
+        self.app_override_originals
+            .get(&(class.to_string(), selector.to_string()))
+            .copied()
     }
 
     /// The class's [ClassHostObject], or `None` for fake/unimplemented

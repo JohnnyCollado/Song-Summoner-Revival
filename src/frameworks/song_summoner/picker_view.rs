@@ -17,7 +17,17 @@
 //! Layout: a navigation bar (title, Cancel, and ‹ Back when drilled into an
 //! artist/album/playlist), a list of 55-point rows with A–Z section headers
 //! and an index strip, and a four-tab bar (Song, Artist, Album, Playlist).
+//!
+//! It also works with a game controller ([handle_pad_button], roles in
+//! [super::pad]): the D-pad moves a focus (the touched-row glow) up and
+//! down or by A–Z section, the shoulder buttons switch tabs, and the
+//! confirm/back buttons pick or open a row and go ‹ Back or Cancel. The
+//! first press after using touch only shows the focus. While the controller
+//! is in use, its button icons ([super::glyphs]) appear next to Back/Cancel
+//! and at the ends of the tab bar.
 
+use super::glyphs::{Family, Glyph};
+use super::pad::{self, Role};
 use super::picker_art::{Art, FIGHTER_COUNT};
 use super::picker_render::*;
 use crate::abi::{CallFromHost, GuestFunction};
@@ -34,7 +44,7 @@ use crate::media::artwork::{self, Bitmap};
 use crate::media::index::{self, Library};
 use crate::media::library;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, SEL};
-use crate::window::DeviceOrientation;
+use crate::window::{DeviceOrientation, PadButton};
 use crate::Environment;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -54,6 +64,11 @@ const TAP_SLOP: f32 = 8.0;
 const FRAME_SECONDS: f64 = 1.0 / 60.0;
 const ROW_CACHE_SIZE: usize = 24;
 const LOADING_FPS: f32 = 12.0;
+/// Rows a controller page (D-pad left/right in lists without sections)
+/// moves: one screenful.
+const ROWS_PER_PAGE: i32 = LIST_H / ROW_H;
+/// Size the controller button icons are drawn at.
+const PROMPT_GLYPH_SIZE: u32 = 18;
 
 enum Row {
     Header(char),
@@ -94,6 +109,8 @@ struct ListView {
     /// Points per second, positive when the content moves up.
     velocity: f32,
     has_index: bool,
+    /// The controller's row. Kept per list, so ‹ Back returns to it.
+    focus: Option<usize>,
 }
 
 impl ListView {
@@ -115,6 +132,7 @@ impl ListView {
             scroll: 0.0,
             velocity: 0.0,
             has_index,
+            focus: None,
         }
     }
 
@@ -179,6 +197,128 @@ impl ListView {
         }
     }
 
+    fn is_selectable(&self, row: usize) -> bool {
+        !matches!(self.rows[row], Row::Header(_))
+    }
+
+    fn is_fully_visible(&self, row: usize) -> bool {
+        let top = self.tops[row] as f32;
+        let bottom = top + self.rows[row].height() as f32;
+        top >= self.scroll && bottom <= self.scroll + LIST_H as f32
+    }
+
+    /// The first selectable row whose top is on screen (or the last one,
+    /// if the list is scrolled past them all).
+    fn first_visible_selectable(&self) -> Option<usize> {
+        let top = self.scroll.max(0.0).ceil() as i32;
+        (0..self.rows.len())
+            .find(|&r| self.tops[r] >= top && self.is_selectable(r))
+            .or_else(|| (0..self.rows.len()).rev().find(|&r| self.is_selectable(r)))
+    }
+
+    /// Scroll just enough to show `row` whole, and the section header just
+    /// above it if it's the first of its section.
+    fn scroll_to_show(&mut self, row: usize) {
+        let top = if row > 0 && !self.is_selectable(row - 1) {
+            self.tops[row - 1]
+        } else {
+            self.tops[row]
+        };
+        let bottom = self.tops[row] + self.rows[row].height();
+        if (top as f32) < self.scroll {
+            self.scroll = top as f32;
+        } else if bottom as f32 > self.scroll + LIST_H as f32 {
+            self.scroll = (bottom - LIST_H) as f32;
+        }
+        self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        self.velocity = 0.0;
+    }
+
+    fn focus_row(&mut self, row: usize) {
+        self.focus = Some(row);
+        self.scroll_to_show(row);
+    }
+
+    /// Put the focus on screen if it isn't: the user may have scrolled away
+    /// by touch since the controller was last used.
+    fn focus_visible(&mut self) {
+        match self.focus {
+            Some(row) if row < self.rows.len() && self.is_fully_visible(row) => {}
+            _ => {
+                self.focus = self.first_visible_selectable();
+                self.velocity = 0.0;
+            }
+        }
+    }
+
+    /// Move the focus `steps` selectable rows down (up if negative),
+    /// stopping at the ends. Without a focus, this only focuses the top
+    /// visible row.
+    fn move_focus(&mut self, steps: i32) {
+        let Some(mut row) = self.focus else {
+            if let Some(first) = self.first_visible_selectable() {
+                self.focus_row(first);
+            }
+            return;
+        };
+        for _ in 0..steps.unsigned_abs() {
+            let next = if steps > 0 {
+                (row + 1..self.rows.len()).find(|&r| self.is_selectable(r))
+            } else {
+                (0..row).rev().find(|&r| self.is_selectable(r))
+            };
+            match next {
+                Some(r) => row = r,
+                None => break,
+            }
+        }
+        self.focus_row(row);
+    }
+
+    /// D-pad left/right: the next A–Z section, or back to the start of the
+    /// current one (then the one before). Lists without sections move a
+    /// page instead.
+    fn jump_section(&mut self, forward: bool) {
+        if !self.rows.iter().any(|r| matches!(r, Row::Header(_))) {
+            self.move_focus(if forward { ROWS_PER_PAGE } else { -ROWS_PER_PAGE });
+            return;
+        }
+        let Some(current) = self.focus.or_else(|| self.first_visible_selectable()) else {
+            return;
+        };
+        let header_before = |r: usize| (0..r).rev().find(|&h| !self.is_selectable(h));
+        let first_after = |h: usize| (h + 1..self.rows.len()).find(|&r| self.is_selectable(r));
+        let header = if forward {
+            (current + 1..self.rows.len()).find(|&h| !self.is_selectable(h))
+        } else {
+            match header_before(current) {
+                Some(h) if first_after(h) != Some(current) => Some(h),
+                Some(h) => header_before(h),
+                None => None,
+            }
+        };
+        match header.and_then(|h| first_after(h).map(|r| (h, r))) {
+            Some((header, row)) => {
+                // Like the index strip: the section's header at the top.
+                self.focus = Some(row);
+                self.scroll = (self.tops[header] as f32).min(self.max_scroll());
+                self.velocity = 0.0;
+            }
+            // Past the last section, or before the first: the very end or
+            // the very start.
+            None => {
+                let end = if forward {
+                    (0..self.rows.len()).rev().find(|&r| self.is_selectable(r))
+                } else {
+                    (0..self.rows.len()).find(|&r| self.is_selectable(r))
+                };
+                if let Some(row) = end {
+                    self.focus_row(row);
+                }
+            }
+        }
+    }
+
     /// Advance momentum and the bounce back from overscroll. Returns true
     /// while there's still movement.
     fn step(&mut self, dt: f32) -> bool {
@@ -221,6 +361,15 @@ enum TouchKind {
     Ignored,
 }
 
+type NavBarKey = (String, Option<String>, Option<(Family, Glyph)>);
+
+struct Held {
+    role: Role,
+    since: Instant,
+    /// Repeats done so far.
+    fired: u32,
+}
+
 struct Transition {
     /// The list area as it looked before the push/pop.
     from: Bitmap,
@@ -237,16 +386,27 @@ pub(super) struct Picker {
     stacks: [Vec<ListView>; 4],
     generation: u64,
     touch: Option<TouchKind>,
-    /// Highlighted row of the current list.
+    /// Highlighted row of the current list, while touched.
     highlight: Option<usize>,
+    /// The controller was used more recently than touch: show its focus
+    /// and button icons.
+    pad_mode: bool,
+    /// Whose button icons to show.
+    family: Family,
+    /// A held direction, for repeating it.
+    held: Option<Held>,
+    /// Hidden while the game shows its confirmation panel.
+    hidden: bool,
     /// Repeating `NSTimer`, retained, while something animates.
     timer: id,
     last_tick: Instant,
     transition: Option<Transition>,
     opened: Instant,
     row_cache: Vec<((u64, usize, bool), Rc<Bitmap>)>,
-    nav_bar: Option<((String, Option<String>), Rc<Bitmap>)>,
-    tab_bar: Option<(usize, Rc<Bitmap>)>,
+    /// Keyed by title, ‹ Back label and back button icon.
+    nav_bar: Option<(NavBarKey, Rc<Bitmap>)>,
+    /// Keyed by tab and shoulder button icons.
+    tab_bar: Option<((usize, Option<Family>), Rc<Bitmap>)>,
     index_strip: Option<(Option<char>, Rc<Bitmap>)>,
 }
 
@@ -412,6 +572,10 @@ pub(super) fn create(env: &mut Environment, controller: id, tab: usize) -> id {
         generation,
         touch: None,
         highlight: None,
+        pad_mode: false,
+        family: Family::Xbox,
+        held: None,
+        hidden: false,
         timer: nil,
         last_tick: Instant::now(),
         transition: None,
@@ -484,6 +648,8 @@ pub(super) fn set_hidden(env: &mut Environment, controller: id, hidden: bool) {
     };
     picker.touch = None;
     picker.highlight = None;
+    picker.held = None;
+    picker.hidden = hidden;
     picker.list_mut().velocity = 0.0;
     let view = picker.view;
     log!("picker: {}", if hidden { "hide" } else { "show" });
@@ -596,6 +762,17 @@ fn tick(env: &mut Environment, controller: id) -> bool {
     if !dragging {
         moving |= picker.list_mut().step(dt);
     }
+    if let Some(held) = &mut picker.held {
+        let due = pad::repeats_due(held.since.elapsed().as_secs_f32());
+        // At most a few per frame, in case a frame came very late.
+        let extra = due.saturating_sub(held.fired).min(4);
+        held.fired = due;
+        let role = held.role;
+        for _ in 0..extra {
+            pad_action(picker.list_mut(), role, false);
+        }
+        moving = true;
+    }
     if let Some(t) = &picker.transition {
         if t.start.elapsed().as_secs_f32() >= SLIDE_SECONDS {
             picker.transition = None;
@@ -611,6 +788,7 @@ fn tick(env: &mut Environment, controller: id) -> bool {
 // Touch handling
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, PartialEq, Eq)]
 enum Action {
     None,
     Pick(u64),
@@ -654,6 +832,9 @@ fn touches_began(env: &mut Environment, view: id, touches: id) {
     let Some(picker) = env.framework_state.song_summoner.pickers.get_mut(&controller) else {
         return;
     };
+    // Touch takes over from the controller: hide its focus and icons.
+    picker.pad_mode = false;
+    picker.held = None;
     if picker.transition.is_some() {
         picker.touch = Some(TouchKind::Ignored);
         return;
@@ -802,11 +983,15 @@ fn touches_ended(env: &mut Environment, view: id, touches: id, cancelled: bool) 
             } else {
                 let lifted_on = list.row_at(p.y - NAV_H as f32);
                 match row {
-                    Some(r) if lifted_on == Some(r) => match &list.rows[r] {
-                        Row::Song { id, .. } => Action::Pick(*id),
-                        Row::Group { .. } => Action::Push(r),
-                        Row::Header(_) => Action::None,
-                    },
+                    Some(r) if lifted_on == Some(r) => {
+                        // A controller picks up from the tapped row.
+                        list.focus = Some(r);
+                        match &list.rows[r] {
+                            Row::Song { id, .. } => Action::Pick(*id),
+                            Row::Group { .. } => Action::Push(r),
+                            Row::Header(_) => Action::None,
+                        }
+                    }
                     _ => {
                         animate = true;
                         Action::None
@@ -817,6 +1002,17 @@ fn touches_ended(env: &mut Environment, view: id, touches: id, cancelled: bool) 
         _ => Action::None,
     };
 
+    animate |= perform(env, controller, action);
+    if animate {
+        start_timer(env, controller);
+    }
+    () = msg![env; view setNeedsDisplay];
+}
+
+/// Carry out a tap's or a button's result. Returns true if it started an
+/// animation.
+fn perform(env: &mut Environment, controller: id, action: Action) -> bool {
+    let mut animate = false;
     match action {
         Action::None => {}
         Action::Pick(pid) => {
@@ -846,6 +1042,9 @@ fn touches_ended(env: &mut Environment, view: id, touches: id, cancelled: bool) 
                 if let Some(picker) = env.framework_state.song_summoner.pickers.get_mut(&controller)
                 {
                     picker.stacks[picker.tab].push(list);
+                    if picker.pad_mode {
+                        picker.list_mut().focus_visible();
+                    }
                     picker.transition = snapshot.map(|from| Transition {
                         from,
                         start: Instant::now(),
@@ -875,13 +1074,118 @@ fn touches_ended(env: &mut Environment, view: id, touches: id, cancelled: bool) 
                 picker.stacks[tab].truncate(1);
                 picker.tab = tab;
                 picker.list_mut().velocity = 0.0;
+                if picker.pad_mode {
+                    picker.list_mut().focus_visible();
+                }
             }
         }
     }
-    if animate {
+    animate
+}
+
+// ---------------------------------------------------------------------------
+// Controller
+// ---------------------------------------------------------------------------
+
+/// What a controller command does to the current list. Tab switching is the
+/// picker's, not the list's, so [Role::PrevTab]/[Role::NextTab] do nothing
+/// here. `waking`: this is the first press since touch was used, which only
+/// brings the focus back into view (so a stray press can't pick a song).
+fn pad_action(list: &mut ListView, role: Role, waking: bool) -> Action {
+    let moves = matches!(
+        role,
+        Role::Up | Role::Down | Role::PrevSection | Role::NextSection | Role::Confirm
+    );
+    if waking && moves {
+        list.focus_visible();
+        return Action::None;
+    }
+    match role {
+        Role::Up => list.move_focus(-1),
+        Role::Down => list.move_focus(1),
+        Role::PrevSection => list.jump_section(false),
+        Role::NextSection => list.jump_section(true),
+        Role::Confirm => {
+            match list.focus.map(|r| (r, &list.rows[r])) {
+                Some((_, Row::Song { id, .. })) => return Action::Pick(*id),
+                Some((r, Row::Group { .. })) => return Action::Push(r),
+                _ => {}
+            }
+            // Nothing focused yet: focus something, don't act.
+            list.move_focus(0);
+        }
+        Role::Back => {
+            return if list.back.is_some() {
+                Action::Pop
+            } else {
+                Action::Cancel
+            };
+        }
+        Role::PrevTab | Role::NextTab | Role::Info => {}
+    }
+    Action::None
+}
+
+/// A controller button went down or up. Returns false if there's no picker
+/// on screen to take it.
+pub(super) fn handle_pad_button(
+    env: &mut Environment,
+    button: PadButton,
+    pressed: bool,
+    controller_type: u32,
+) -> bool {
+    // While the picker is hidden, the game's own confirmation panel is up,
+    // and that's the game's to handle.
+    let Some(controller) = env
+        .framework_state
+        .song_summoner
+        .pickers
+        .values()
+        .find(|p| !p.hidden)
+        .map(|p| p.controller)
+    else {
+        return false;
+    };
+    // Buttons the picker has no use for still don't reach the game.
+    let Some(role) = pad::role(button, env.options.confirm_button) else {
+        return true;
+    };
+    let picker = env
+        .framework_state
+        .song_summoner
+        .pickers
+        .get_mut(&controller)
+        .unwrap();
+    if !pressed {
+        if picker.held.as_ref().is_some_and(|h| h.role == role) {
+            picker.held = None;
+        }
+        return true;
+    }
+    // Mid-slide, or while a finger is down, the list is spoken for.
+    if picker.transition.is_some() || picker.touch.is_some() || library::is_scanning() {
+        return true;
+    }
+    picker.family = Family::from_sdl_type(controller_type);
+    let waking = !picker.pad_mode;
+    picker.pad_mode = true;
+    let action = match role {
+        Role::PrevTab => Action::SwitchTab(pad::tab_after(picker.tab, -1)),
+        Role::NextTab => Action::SwitchTab(pad::tab_after(picker.tab, 1)),
+        _ => pad_action(picker.list_mut(), role, waking),
+    };
+    picker.held = pad::repeats(role).then(|| Held {
+        role,
+        since: Instant::now(),
+        fired: 0,
+    });
+    let view = picker.view;
+    let holding = picker.held.is_some();
+    if perform(env, controller, action) || holding {
         start_timer(env, controller);
     }
     () = msg![env; view setNeedsDisplay];
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,7 +1357,9 @@ fn cached_row(
     ctx: &Ctx,
     fighters: &HashMap<u64, Option<u32>>,
 ) -> Rc<Bitmap> {
-    let highlighted = picker.highlight == Some(row_index) && picker.transition.is_none();
+    let focused = picker.pad_mode && picker.list().focus == Some(row_index);
+    let highlighted =
+        (picker.highlight == Some(row_index) || focused) && picker.transition.is_none();
     let key = (picker.list().uid, row_index, highlighted);
     if let Some(pos) = picker.row_cache.iter().position(|(k, _)| *k == key) {
         let entry = picker.row_cache.remove(pos);
@@ -1140,7 +1446,14 @@ fn render_index_strip(fonts: &Fonts, active: Option<char>) -> Bitmap {
     canvas.bitmap
 }
 
-fn render_nav_bar(fonts: &Fonts, title: &str, back: Option<&str>) -> Bitmap {
+/// `glyph`: the controller's back button icon, drawn beside whichever of
+/// ‹ Back or Cancel it presses.
+fn render_nav_bar(
+    fonts: &Fonts,
+    title: &str,
+    back: Option<&str>,
+    glyph: Option<&Bitmap>,
+) -> Bitmap {
     let mut canvas = Canvas::new(W, NAV_H);
     canvas.vgradient(0, 0, W, NAV_H, NAV_TOP, NAV_BOTTOM);
     canvas.fill_rect(0, NAV_H - 2, W, 1, NAV_RULE, 1.0);
@@ -1157,13 +1470,32 @@ fn render_nav_bar(fonts: &Fonts, title: &str, back: Option<&str>) -> Bitmap {
     if let Some(back) = back {
         button(&mut canvas, 6, &format!("‹ {back}"));
     }
+    if let Some(glyph) = glyph {
+        let size = glyph.width as i32;
+        let x = match back {
+            Some(back) => 6 + back_button_width(fonts, back) + 4,
+            None => cancel_button_x(fonts) - 4 - size,
+        };
+        canvas.blit(glyph, x, 8 + (27 - size) / 2, 1.0);
+    }
     canvas.bitmap
 }
 
-fn render_tab_bar(ctx: &Ctx, selected: usize) -> Bitmap {
+/// `bumpers`: the controller's left and right shoulder button icons, drawn
+/// at the ends of the bar since they switch tabs.
+fn render_tab_bar(
+    ctx: &Ctx,
+    selected: usize,
+    bumpers: Option<(&Bitmap, &Bitmap)>,
+) -> Bitmap {
     let mut canvas = Canvas::new(W, TAB_H);
     canvas.vgradient(0, 0, W, TAB_H, TAB_TOP, (0, 0, 0));
     canvas.fill_rect(0, 0, W, 1, TAB_RULE, 1.0);
+    if let Some((left, right)) = bumpers {
+        let y = (TAB_H - left.height as i32) / 2;
+        canvas.blit(left, 3, y, 0.8);
+        canvas.blit(right, W - 3 - right.width as i32, y, 0.8);
+    }
     for (i, label) in TAB_NAMES.iter().enumerate() {
         let x = i as i32 * TAB_W;
         let is_selected = i == selected;
@@ -1260,9 +1592,12 @@ fn snapshot_list(env: &mut Environment, controller: id) -> Option<Bitmap> {
 fn render(env: &mut Environment, controller: id) -> Option<Bitmap> {
     resolve_fighters(env, controller);
     let ctx = ctx(env);
+    let back_glyph = pad::back_glyph(env.options.confirm_button);
     let state = &mut env.framework_state.song_summoner;
     let picker = state.pickers.get_mut(&controller)?;
     let fighters = &state.fighters;
+    // The controller's icons, only while it's in use.
+    let family = picker.pad_mode.then_some(picker.family);
 
     let mut canvas = Canvas::new(W, H);
     canvas.fill_rect(0, 0, W, H, BACKGROUND, 1.0);
@@ -1283,22 +1618,42 @@ fn render(env: &mut Environment, controller: id) -> Option<Bitmap> {
         None => canvas.blit(&list_area, 0, NAV_H, 1.0),
     }
 
-    let nav_key = (picker.list().title.clone(), picker.list().back.clone());
+    let nav_key = (
+        picker.list().title.clone(),
+        picker.list().back.clone(),
+        family.map(|f| (f, back_glyph)),
+    );
     let nav_bar = match &picker.nav_bar {
         Some((key, bitmap)) if *key == nav_key => bitmap.clone(),
         _ => {
-            let bitmap = Rc::new(render_nav_bar(&ctx.fonts, &nav_key.0, nav_key.1.as_deref()));
+            let glyph = nav_key
+                .2
+                .map(|(f, g)| state.glyphs.get(f, g, PROMPT_GLYPH_SIZE));
+            let bitmap = Rc::new(render_nav_bar(
+                &ctx.fonts,
+                &nav_key.0,
+                nav_key.1.as_deref(),
+                glyph.as_deref(),
+            ));
             picker.nav_bar = Some((nav_key, bitmap.clone()));
             bitmap
         }
     };
     canvas.blit(&nav_bar, 0, 0, 1.0);
 
+    let tab_key = (picker.tab, family);
     let tab_bar = match &picker.tab_bar {
-        Some((tab, bitmap)) if *tab == picker.tab => bitmap.clone(),
+        Some((key, bitmap)) if *key == tab_key => bitmap.clone(),
         _ => {
-            let bitmap = Rc::new(render_tab_bar(&ctx, picker.tab));
-            picker.tab_bar = Some((picker.tab, bitmap.clone()));
+            let bumpers = family.map(|f| {
+                (
+                    state.glyphs.get(f, Glyph::BumperLeft, PROMPT_GLYPH_SIZE),
+                    state.glyphs.get(f, Glyph::BumperRight, PROMPT_GLYPH_SIZE),
+                )
+            });
+            let bumpers = bumpers.as_ref().map(|(l, r)| (&**l, &**r));
+            let bitmap = Rc::new(render_tab_bar(&ctx, picker.tab, bumpers));
+            picker.tab_bar = Some((tab_key, bitmap.clone()));
             bitmap
         }
     };
@@ -1409,5 +1764,223 @@ mod tests {
     fn ids_without_a_portrait_file_draw_nothing() {
         assert_eq!(portrait_for_fid(FIGHTER_COUNT as i32), None);
         assert_eq!(portrait_for_fid(-3), None);
+    }
+
+    // Controller navigation. The list area is LIST_H = 220 points: four
+    // 55-point rows, or fewer with 22-point section headers among them.
+
+    fn song(id: u64) -> Row {
+        Row::Song {
+            id,
+            title: format!("Song {id}"),
+            subtitle: String::new(),
+            artwork: false,
+        }
+    }
+
+    fn group(name: &str) -> Row {
+        Row::Group {
+            name: name.to_string(),
+            songs: vec![1, 2],
+            artwork: None,
+        }
+    }
+
+    /// Sections A, B, C, D of three songs each: rows are
+    /// 0:A 1 2 3  4:B 5 6 7  8:C 9 10 11  12:D 13 14 15.
+    fn sectioned() -> ListView {
+        let mut rows = Vec::new();
+        let mut id = 1;
+        for letter in ['A', 'B', 'C', 'D'] {
+            rows.push(Row::Header(letter));
+            for _ in 0..3 {
+                rows.push(song(id));
+                id += 1;
+            }
+        }
+        ListView::new(1, "Song".to_string(), None, rows)
+    }
+
+    /// Ten songs, no headers, drilled in (has a Back button).
+    fn plain() -> ListView {
+        let rows = (1..=10).map(song).collect();
+        ListView::new(2, "Album".to_string(), Some("Album".to_string()), rows)
+    }
+
+    fn fully_visible(list: &ListView, row: usize) -> bool {
+        let top = list.tops[row] as f32;
+        let bottom = top + list.rows[row].height() as f32;
+        top >= list.scroll && bottom <= list.scroll + LIST_H as f32
+    }
+
+    #[test]
+    fn first_press_focuses_the_top_visible_row_without_moving() {
+        let mut list = sectioned();
+        assert_eq!(list.focus, None);
+        list.move_focus(1);
+        // Row 0 is the "A" header, which can't be focused.
+        assert_eq!(list.focus, Some(1));
+        assert_eq!(list.scroll, 0.0);
+    }
+
+    #[test]
+    fn first_press_on_a_scrolled_list_stays_where_the_user_is() {
+        let mut list = sectioned();
+        // Scrolled so row 5 (first of B) is at the top.
+        list.scroll = list.tops[5] as f32;
+        list.move_focus(1);
+        assert_eq!(list.focus, Some(5));
+    }
+
+    #[test]
+    fn up_and_down_skip_headers_and_stop_at_the_ends() {
+        let mut list = sectioned();
+        list.move_focus(1); // focus row 1
+        list.move_focus(1);
+        list.move_focus(1);
+        assert_eq!(list.focus, Some(3));
+        list.move_focus(1); // over the "B" header
+        assert_eq!(list.focus, Some(5));
+        list.move_focus(-1);
+        assert_eq!(list.focus, Some(3));
+        list.move_focus(-10);
+        assert_eq!(list.focus, Some(1));
+        list.move_focus(100);
+        assert_eq!(list.focus, Some(15));
+        list.move_focus(1);
+        assert_eq!(list.focus, Some(15));
+    }
+
+    #[test]
+    fn focus_is_scrolled_into_view() {
+        let mut list = sectioned();
+        list.move_focus(1);
+        for _ in 0..8 {
+            list.move_focus(1);
+            let row = list.focus.unwrap();
+            assert!(fully_visible(&list, row), "row {row} at scroll {}", list.scroll);
+        }
+        assert!(list.scroll > 0.0);
+        // The scroll never goes past the end of the list.
+        list.move_focus(100);
+        assert!(list.scroll <= list.max_scroll());
+        assert!(fully_visible(&list, 15));
+    }
+
+    #[test]
+    fn moving_up_into_a_section_shows_its_header() {
+        let mut list = sectioned();
+        list.scroll = list.max_scroll();
+        list.focus = Some(13); // first song of D
+        list.move_focus(-1); // row 11, last of C
+        list.move_focus(-1);
+        list.move_focus(-1); // row 9, first of C
+        assert_eq!(list.focus, Some(9));
+        // The "C" header (row 8) is on screen too.
+        assert!(list.scroll <= list.tops[8] as f32);
+    }
+
+    #[test]
+    fn right_jumps_to_the_next_section() {
+        let mut list = sectioned();
+        list.focus = Some(2);
+        list.jump_section(true);
+        assert_eq!(list.focus, Some(5)); // first of B
+        // With its header at the top of the list.
+        assert_eq!(list.scroll, list.tops[4] as f32);
+        list.jump_section(true);
+        assert_eq!(list.focus, Some(9));
+        list.jump_section(true);
+        assert_eq!(list.focus, Some(13));
+        // No section after D: go to the last song.
+        list.jump_section(true);
+        assert_eq!(list.focus, Some(15));
+        assert!(fully_visible(&list, 15));
+    }
+
+    #[test]
+    fn left_goes_to_the_start_of_the_section_then_the_one_before() {
+        let mut list = sectioned();
+        list.focus = Some(11); // last of C
+        list.jump_section(false);
+        assert_eq!(list.focus, Some(9)); // first of C
+        list.jump_section(false);
+        assert_eq!(list.focus, Some(5)); // first of B
+        list.jump_section(false);
+        assert_eq!(list.focus, Some(1));
+        list.jump_section(false);
+        assert_eq!(list.focus, Some(1));
+        assert_eq!(list.scroll, 0.0);
+    }
+
+    #[test]
+    fn left_and_right_page_through_lists_without_sections() {
+        let mut list = plain();
+        list.move_focus(1); // focus row 0
+        list.jump_section(true);
+        assert_eq!(list.focus, Some(4)); // a page is 4 rows
+        list.jump_section(true);
+        list.jump_section(true);
+        assert_eq!(list.focus, Some(9)); // stops at the end
+        list.jump_section(false);
+        assert_eq!(list.focus, Some(5));
+        assert!(fully_visible(&list, 5));
+    }
+
+    #[test]
+    fn empty_lists_have_nothing_to_focus() {
+        let mut list = ListView::new(3, "Playlist".to_string(), None, Vec::new());
+        list.move_focus(1);
+        list.jump_section(true);
+        list.jump_section(false);
+        assert_eq!(list.focus, None);
+        assert_eq!(pad_action(&mut list, Role::Confirm, false), Action::None);
+    }
+
+    #[test]
+    fn confirm_picks_a_song_or_opens_a_group() {
+        let mut list = plain();
+        list.focus = Some(2);
+        assert_eq!(pad_action(&mut list, Role::Confirm, false), Action::Pick(3));
+
+        let rows = vec![Row::Header('A'), group("Abba"), group("Air")];
+        let mut list = ListView::new(4, "Artist".to_string(), None, rows);
+        list.focus = Some(2);
+        assert_eq!(pad_action(&mut list, Role::Confirm, false), Action::Push(2));
+    }
+
+    #[test]
+    fn confirm_without_a_focus_only_shows_one() {
+        let mut list = plain();
+        assert_eq!(pad_action(&mut list, Role::Confirm, false), Action::None);
+        assert_eq!(list.focus, Some(0));
+    }
+
+    #[test]
+    fn back_leaves_a_group_or_cancels_at_the_top() {
+        let mut list = plain(); // drilled in
+        assert_eq!(pad_action(&mut list, Role::Back, false), Action::Pop);
+        let mut list = sectioned(); // a tab's top level
+        assert_eq!(pad_action(&mut list, Role::Back, false), Action::Cancel);
+    }
+
+    #[test]
+    fn first_press_after_touch_only_brings_the_focus_back() {
+        // The user scrolled away by touch, so the old focus is off screen.
+        for role in [Role::Down, Role::Up, Role::NextSection, Role::Confirm] {
+            let mut list = sectioned();
+            list.focus = Some(1);
+            list.scroll = list.tops[9] as f32;
+            assert_eq!(pad_action(&mut list, role, true), Action::None, "{role:?}");
+            assert_eq!(list.focus, Some(9), "{role:?}");
+        }
+        // A focus that's still on screen is kept as is.
+        let mut list = sectioned();
+        list.scroll = list.tops[9] as f32;
+        list.focus = Some(10);
+        assert_eq!(pad_action(&mut list, Role::Down, true), Action::None);
+        assert_eq!(list.focus, Some(10));
+        // Back still works straight away.
+        assert_eq!(pad_action(&mut list, Role::Back, true), Action::Cancel);
     }
 }

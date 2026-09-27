@@ -72,6 +72,13 @@ Game controller options:
         The --button-to-touch=, --dpad-to-touch= and --stick-to-touch= options
         still work.
 
+    --confirm-button=...
+        Which face button confirms in menus touchHLE draws itself (currently
+        Song Summoner's music picker): south (the bottom button: A on Xbox,
+        Cross on PlayStation, B on Switch) or east (the right button: B on
+        Xbox, Circle on PlayStation, A on Switch). The other one goes back.
+        The default is south.
+
     --x-tilt-range=...
     --y-tilt-range=...
         Set the simulated rotation range of the device axis mapped to the analog

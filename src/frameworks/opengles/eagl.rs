@@ -552,6 +552,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     let viewport = env.window.as_mut().unwrap().viewport();
     let rotation_matrix = env.window.as_mut().unwrap().rotation_matrix();
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
+    let focus_marker = env.window.as_mut().unwrap().focus_marker_visible_at();
 
     let gles_ctx = super::get_thread_context(
         &mut env.framework_state.opengles,
@@ -679,7 +680,13 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     );
 
     // Draw the quad
-    present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
+    present_frame(
+        gles,
+        viewport,
+        rotation_matrix,
+        virtual_cursor_visible_at,
+        focus_marker,
+    );
 
     // Clean up the texture
     gles.DeleteTextures(1, &texture);

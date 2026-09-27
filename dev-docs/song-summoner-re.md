@@ -286,6 +286,256 @@ button rects from `SysButtonMenu_Position/Size` for D-pad focus. Map A
 to `SysMessage_Next` when a KeyMark is shown, otherwise to a tap at the
 focused rect.
 
+### Frame loop and injection (confirmed 2026-09-27)
+
+- `-[MainView mainLoop]` (0x96a0) is the frame callback. With
+  `m_mode == 1` (picker up) it skips the scene; otherwise it calls
+  `MainLoop_Main` (0x3418).
+- `MainLoop_Main`: if `_mainloop_work+0` (the next phase, set by
+  `MainLoop_Set_NextPhase`) is non-zero it opens that scene
+  (`SysTask_Open(Init, Main, Exit)`) and stores the scene number in
+  `_savedat+0`. Then, every frame: `SysTask_Main` (the scene, which reads
+  touch), `SysFile_Main`, **`SysTouch_Main`**, textures, anims, prims,
+  `SysMessage_Main`.
+- `SysTouch_Main` clears `+0x54` (began) each frame, and after `+0x58`
+  (ended) calls `SysTouch_Clear`. **So a synthetic tap must put Began
+  and Ended before different frames**, or the scene never sees the Began.
+- Signatures (from the `touches*` callers): `Began_F1(CGPoint *pos,
+  CGPoint *prev, int fingers, int tapCount)`, `Moved_F1(pos, prev,
+  fingers)`, `Ended_F1(pos, fingers)`. Points are `locationInView:` of the
+  MainView, whose bounds are set to **480×320 landscape**, the same space
+  as the picker.
+- Scene numbers `MainLoop_Main` stores in `_savedat+0`: 1 Bumper, 2 Title,
+  3 ListeningPoint, 5 Tactics, 6 Result, 7 Worldmap, 8 Catalog2, 9 Town,
+  10 Palace, 11 Shop, 12 Colosseum, 13 Ending, 14 StageSelect (15+ are
+  test scenes). But `_savedat` is the **save data**, so after a load `+0`
+  is the saved location, not the current scene. The scene task's main
+  function (task table) is the reliable way to tell the current scene.
+- `_savedat`, `_touch_work`, `_mainloop_work` and the `SysTouch_*`
+  functions are all in the symbol table, so touchHLE looks them up by name
+  (`game_input.rs`), not by address.
+
+### Task table and `SysButtonMenu` (confirmed 2026-09-27)
+
+- `_task_manage`: 16 slots of 0x1c bytes. `+0x0` state (2 = running),
+  `+0xc` init, `+0x10` main, `+0x14` exit (function pointers with the
+  Thumb bit), `+0x18` work struct. `SysTask_Open` takes the **first free**
+  slot, so table order isn't opening order. `SysTask_Main` runs slots 0–15
+  each frame with `_task_play_num` set to the slot.
+- A `SysButtonMenu` is a task whose main is `SysButtonMenu_Main`. Its work
+  struct: `+0x0` state (1 loading, 2 accepting input, 3 closing), `+0x4`
+  Check's sub-state, `+0xc` button count, `+0x14` pressed button, `+0x18`
+  / `+0x1a` position x/y and `+0x1c` / `+0x1e` button w/h (`short`s),
+  `+0x20` "tap outside cancels", `+0x28` cancel-button prim (-1 if none),
+  `+0x2c` → `int enabled[count]`, `+0x30` → prim ids, `+0x34` → label
+  message ids.
+- Layout: a column centred on (x, y). Button i is centred at (x,
+  y − (h·(count−1))/2 + i·(h+2)) (C integer division), size w×h.
+- `SysButtonMenu_Check(menu)` on a touch **ended**: a hit on an enabled
+  button plays SE 9, animates it for 5 frames, then returns its index. A
+  disabled one plays SE 1. A miss with "tap outside cancels" on (and no
+  flick) plays SE 3 and returns −2 (cancel). Otherwise it returns −1.
+- `SysButtonMenu_Enable_CancelButton` adds a cancel icon (`tc_icon.png`,
+  48×48, centred at (456, 296)) as the prim at `+0x28`. Tapping it plays
+  SE 9, animates it for 5 frames, and Check returns −3. Note that
+  `SysPrim_Touch_DrawRect` returns **0 on a hit**. The Hip-O-Drome menu
+  (`PalaceFlow_TutorialMenu`) is a `SysButtonMenu` with this icon.
+- `Title_Open_StartMenu` opens a `SysButtonMenu` at (240, 212), buttons
+  160×54, with `Enable_OutrangeCancel`. That's not the menu after "press
+  start", though (see `SysDrum2`).
+
+### `SysDialog`, message boxes with buttons (confirmed 2026-09-27)
+
+- `SysDialog_Open` is `SysButtonMenu_Open(…, eMENU_DIRECTION)` with
+  direction 2. It makes a task whose main is `dialogmain`
+  (`__ZL10dialogmainv`). Example: "Start from last Auto save?" No / Yes.
+- Work struct: `+0x0` state (takes touches above 2; 0x63 = a button was
+  pressed, 0x65 = cancelled), `+0xc` message id, `+0x1c` button count,
+  button i at `+0x28 + i·0x14`: `short` x, y, w, h (top-left rect), `int`
+  enabled at `+8`. `+0xc8` the result, `+0xcc` the button the finger went
+  down on, `+0xf0` "a tap off the buttons cancels" (`Enable_Cancel`).
+- `SysDialog_Check`: a press needs Began and Ended on the same button.
+  While the message is still printing (`SysMessage_Get_ComState != 5`)
+  taps are ignored. With no buttons, a tap advances the message
+  (`SysMessage_Next`). A tap off the buttons with `+0xf0 == 1` plays SE 3
+  and cancels.
+
+### Sprites, and screens with their own buttons (confirmed 2026-09-27)
+
+- `_prim_work`: sprites ("prims"), 0x54 bytes each, indexed by prim id.
+  `+0x0` in use, `+0x8` shown, float `+0xc` x, `+0x10` y, `+0x14` w,
+  `+0x18` h; with `+0x38` set, x/y are the centre.
+- `SysPrim_Touch_DrawRect(id, point)` returns **0** when the point is in
+  that rectangle (edges included), −1 otherwise. Screens that draw their
+  own buttons hit-test them with it, so a sprite's rectangle is exactly
+  the tappable area.
+- Hip-O-Drome (`Palace_Main`): five button sprites, ids at `work +
+  0x454 + i·4`, placed at x = `+0x418` (slide offset) + 350, y stepping
+  44. On finger-up it stores the hit index at `+0x414`. The same code runs
+  the tutorial's first pull (other buttons greyed) and the full menu.
+  `PalaceFlow_TutorialMenu` separately opens a `SysButtonMenu` for a
+  tutorial sub-menu.
+- The Hip-O-Drome's panel after picking a song (0x187e8): on finger-up
+  it tests the sprites at `+0x47c` (Create Trooper → index 0), `+0x480`
+  (No → 1) and `+0x48c` (the back icon → 2), stores the index at `+0x414`,
+  then animates the pressed sprite for 5 frames. Closed sprite ids are set
+  to −1.
+- Towns (`Town_Main`; Soul Master's Place is one): `TownMenu_Ctrl` tests
+  the icon sprites at `work + 0x60 … 0x78` (seven), skipping any whose
+  `SysPrim_Get_Disp` isn't 1. `TownMenu_Disp` shows the subset the town's
+  row of `_town_icontable` enables (7 ints per town, indexed by
+  `_savedat + 0x8b78`). `TownMenu_Update_PosSize` puts them at y = 160.
+
+### The card list (`_cardlist_work`) (confirmed in code 2026-09-27)
+
+Used to pick a trooper (delete, and elsewhere). One global work struct:
+`+0x0` state, `+0xc` mode, `+0x14` region the finger went down on,
+`+0x18` the command region on a press, `+0x1c` card count, `+0x20` scroll
+position (12 per card), `+0x34` x centre of the card strip, `+0x38`
+selected card, `+0x40` target scroll, `+0x4c` key lock (1 = ignore
+touch), `+0x58` status-panel mode, bottom icon sprite ids at `+0x3c8`,
+`+0x3c4`, `+0x3cc`, `+0x3d0` (regions 5–8), scrubber knob sprite at
+`+0x3b8`.
+
+`CardList_Flow_Select` on finger-down picks a region: 4 = status panel
+(x ≤ 160, only in status-panel mode), 3 = the scrubber (x within c ± 136,
+y 216–272; jumps to the card under the finger), 1 = the card band
+(40 < y < 224), 5–8 = the icons (`SysPrim_Touch_DrawRect`). On a non-flick
+finger-up: 5/6 play SE 9 and set state 2 with `+0x18` = the region; 7/8
+do the same only in mode 2 with their flags (`+0x53`/`+0x54`), else SE 1;
+4 is `Status_Change`; 1 with x within c ± 55 returns 1 (the middle card
+picked), else x < c − 55 turns the list back one card (two if x ≤ 60) and
+x > c + 55 forward one (two if x ≥ 420). `CardList_AutoScroll(i)` and
+`CardList_Set_Select(i)` exist too; touchHLE uses taps instead.
+
+What the icon regions do (`CardList_Main`, after state 2): region 5
+(`+0x3c8`, the status icon) toggles status mode `+0x58` (opening or
+closing the stats panel); region 6 (`+0x3c4`) closes the panel and
+returns 2, leaving the list. touchHLE's north button taps region 5 (or the
+open panel, to flip it); back taps region 5 while the panel is open, else
+region 6.
+
+### `SysMenu`, scrolling lists (item list) (confirmed in code 2026-09-27)
+
+- A task whose main is `Menumenumain` (`__ZL12Menumenumainv`), which runs
+  `menumain(work)`. `SysMenu_Open(shown, z, …)`, `AddSelect` adds items
+  (up to 64), `Set_Position` (`+0xd08/+0xd0a`), `Set_Size` (`+0xd0c`
+  width, `+0xd0e`), `Get_Cursor` reads byte `+2`.
+- Work struct: byte `+2` cursor, `+4` item count, `+5` rows shown. Item i
+  is 0x34 bytes at `+0xc + i·0x34`: byte `+0x14` enabled, `short`
+  `+0x30/+0x32` its row's current x, y (moved as it scrolls). `+0xd18`
+  scroll position in rows (float), `+0xd1c` scroll speed.
+- `SysMenu_Check2` (the item list's): finger down stops the scroll; a held
+  finger on an enabled row makes it the cursor (highlight); a moving finger
+  (flick) sets the speed to −Δy / 24 per frame. On a non-flick finger-up: a
+  row (x ≤ px < x + width, y ≤ py < y + 40) that's enabled returns its
+  index, a disabled one −3, no row −2 (cancel). It tests every row, **even
+  ones scrolled out of the window**, so only tap rows on screen.
+- `menumain`: position += speed, speed × 0.9 each frame, clamped to the
+  list; below 0.08 the speed stops and the position rounds to a whole row.
+  So one move of 4.8 points scrolls about one row.
+
+### Edit Troopers (`Teammake`) sort panel and the status panel
+
+- `Teammake_Open` makes a task (`Teammake_Main`). Its sort panel
+  (`Teammake_Check`, 0x558ee) has six rows at x 80–400, y 37 + 46·i to
+  83 + 46·i, row sprites at `work + 0x4c … 0x60`. A tap on a row changes
+  that row's setting (state 12), the back icon sprite `+0x3c` closes it
+  (state 13), and a tap well outside (x < 60, x > 420, y < 20, y > 310)
+  cancels (SE 3). The panel shows over the card list.
+- The status panel is part of the card list: in status mode (`+0x58` = 1)
+  a tap at x ≤ 160 is region 4, `Status_Change`, which flips between the
+  stats and skill pages.
+
+### Options (pause menu > Options) (read from code 2026-09-27)
+
+- `Option_Open` makes a task (`Option_Main`, 0xfba0; init `Option_Init`,
+  exit `Option_Exit`); `Option_Check` (0x10198) does the touch handling.
+  The pause menu's `SysButtonMenu` stays open under it.
+- Work struct (0x70 bytes): `+0` state (2 = shown), `+4` touch sub-state
+  (0/1 waiting for a touch, 2 a button's press animation, 3 a switch's),
+  `+8` what the current touch grabbed, `+0x1c` shows an extra button
+  (`+0x64`, `button_001.png` at (114, 292), 208×44 centred). Sprite ids:
+  `+0x44` volume bar, `+0x48` volume knob (32×32 centred at
+  (254 + 200·volume, 64)), `+0x4c/0x50/0x54` switch art, `+0x58/0x5c/0x60`
+  the BGM/SE/lock switches' knobs (45×42, top-left at x = 368 + 44·on,
+  y 88/168/220), `+0x68` back icon (`tc_icon.png`, 48×48 at (456, 296)).
+  Settings are `_configdat`: float volume at `+0`, bytes BGM `+4`, SE `+5`,
+  lock orientation `+6`.
+- Finger-down on the volume knob grabs it; while held, the volume is
+  clamp((x − 254) / 2, 0, 100) / 100 of the finger's x, every frame.
+- Finger-down on a switch's knob grabs that switch; its finger-up sets it
+  by the last move's direction (so a still tap on the knob turns it off).
+- Otherwise a non-flick finger-up in (368, 84, 88, 40), (368, 164, 88, 40)
+  or (368, 216, 88, 40) flips BGM, SE or lock orientation, and one on the
+  back icon (or the extra button) plays SE 9 and closes.
+- So the controller drags the knob for volume, and taps a switch's box on
+  the half away from its knob.
+
+### Help (pause menu > Help) (read from code 2026-09-27)
+
+- A task, `Help2_Main` (0x60b2c); the pause menu stays open under it.
+  Work struct (`stHELP2_WORK`): `+0` state (3 the list, 4 opening an item,
+  5 an item's page, 6 closing it, 7/8 next/previous item, 10 a sideways
+  swipe, 0x63 exit), `+0xc` page height, `+0x10` tab, `+0x14` item count,
+  `+0x18` item touched/opened (-1 none), `+0x1c` list height, `+0x20/+0x24`
+  list scroll position/speed, `+0x28/+0x2c` page scroll position/speed,
+  `+0x54` row highlight sprite, row sprites at `+0x80 + 4i` (y = 32 + 56i
+  − scroll).
+- List (state 3): finger-down on a row sprite sets `+0x18`; a non-flick
+  finger-up at y < 256 opens it (`SysHelp2_Open_MenuItem`, SE 9), at
+  y ≥ 256 picks tab x / 80 (tab 5 is Exit: state 0x63). A move sets the
+  speed to the move (previous y − y); each frame the position gains the
+  speed and the speed drops 10%, so a drag glides 10× its last move,
+  clamped to 0..`+0x1c` − 224. Rows show from y 32 to 256.
+- Page (state 5): a non-flick finger-up at x > 400, y < 72 closes it;
+  x < 48, 36 ≤ y ≤ 320 opens the previous item and x > 432, 76 ≤ y ≤ 320
+  the next (if any). A vertical move scrolls the text the same way as the
+  list (clamped to `+0xc` − 272); a sideways one over 24 points swipes.
+
+### `SysDrum2`, the rotating drum (title menu) (confirmed 2026-09-27)
+
+- `SysDrum2_Open` makes a task whose main is `drummenumain2`
+  (`__ZL13drummenumain2v`). The title's drum: `AddSelect` × items,
+  `Set_Position(110, 152)`, `Set_Size(260, 128)`, `Set_Cursor`,
+  `Enable_OutrangeTouch`.
+- Work struct: byte `+0` state (2/3 = handling touches), `+2/+3` cursor
+  item (bytes), `+8` counter (`Get_CursorCounter`), `+0xc` outrange
+  touch, `+0x290/+0x292` position, `+0x294/+0x296` size (`short`s),
+  `+0x298` from Open's first argument, `+0x29c` angle (float), `+0x2a0`
+  spin velocity, `+0x2a8` offset (settled when both are 0:
+  `SysDrum2_CheckCursordisp`), `+0x2b4` "armed" (set while touching, by
+  `drummenumain2`), item i's value at `+0x34 + i·40`.
+- `SysDrum2_Check` on an armed, non-flick finger-up: with c = y − 8 +
+  h/2, a tap with y < c sets the velocity to +0.5 (turn), y > c + h/3
+  sets it to −0.5 (turn the other way), and in between returns the
+  cursor item's value. A turn only starts if the velocity was 0.
+- In testing, a tap above the band brings in the item below it, and one
+  under the band the item above. So the controller's up taps under the
+  band and down above it.
+- So on the title drum the select band is y 208–250. The old centre tap at
+  y = 160 was above it, which turned the drum: the "scrolling" seen in
+  testing.
+
+### Milestones
+
+1. **Picker** (done 2026-09-27, tested on a real pad): D-pad focus,
+   section jumps, tabs on the shoulders, confirm/back, button icons.
+   `picker_view.rs`, `pad.rs`.
+2. **Plumbing** (done 2026-09-27: confirm starts the game from the title
+   screen): `game_input.rs` wraps `-[MainView mainLoop]`, logs scene
+   changes, and injects taps through `SysTouch_Began_F1`/`Ended_F1`.
+3. **Dialogs and generic menus** (in progress: `SysDrum2`, `SysDialog`
+   and the title's `SysButtonMenu` confirmed 2026-09-27, with a
+   touchHLE-drawn focus outline; the Hip-O-Drome menu, its song panel and
+   town icons, the card list (delete screen), Edit Troopers' item list,
+   sort panel and status panel (north button) and Options
+   confirmed; Help written, not yet tested): A advances text (`SysMessage_Next`),
+   the D-pad moves between `SysButtonMenu` rects, B backs out. This
+   includes the game's Yes/No panel after picking a song.
+4. **Battle**: unit/command menus, D-pad on the map cursor.
+5. **Town, world map, formation, password keyboard**, one at a time.
+
 ## Tools (`inspect/`)
 
 Extract `Payload/S.S.Encore.app/S.S.Encore` from your own IPA into the

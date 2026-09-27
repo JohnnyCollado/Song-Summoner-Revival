@@ -119,3 +119,6 @@ SongSummoner_Android.zip
 /inspect/Lning@iphonecake.com
 # AI assistant briefs / scratch notes -- not part of the project.
 /inspect/PROBLEM_FOR_*.md
+
+# Python bytecode caches (inspect/ and dev-scripts/ tools)
+__pycache__/
