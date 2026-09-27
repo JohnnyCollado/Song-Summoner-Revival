@@ -94,8 +94,8 @@ fn build_windows(release: bool) -> Result<(), String> {
     // would clobber the user's edits on every build.
 
     // Runtime images the engine loads relative to its working directory:
-    // the album-art placeholder (ui_table_view.rs) and the virtual-cursor
-    // sprites (window.rs), under either naming convention.
+    // the virtual-cursor sprites (window.rs), under either naming
+    // convention.
     let res_out = out.join("res");
     std::fs::create_dir_all(&res_out).map_err(|e| io_err("create", &res_out, e))?;
     let res_in = root.join("res");
@@ -103,9 +103,8 @@ fn build_windows(release: bool) -> Result<(), String> {
     for entry in entries {
         let entry = entry.map_err(|e| io_err("read", &res_in, e))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let wanted = name == "album_placeholder.png"
-            || (name.ends_with(".png")
-                && (name.starts_with("cursor_") || name.starts_with("Cursor ")));
+        let wanted = name.ends_with(".png")
+            && (name.starts_with("cursor_") || name.starts_with("Cursor "));
         if wanted {
             copy_file(&entry.path(), &res_out.join(&name))?;
         }

@@ -54,11 +54,11 @@ run.log
 touchHLE_log.txt
 DUMP.txt
 
-# Per-user cache that contains absolute paths from the developer's
-# machine. (touchHLE_options.txt stays tracked: src/paths.rs embeds it
-# as the template for new users, so keep personal edits out of it.)
-touchHLE_music_library.txt
-touchHLE_music_library_cache.tsv
+# The music library a run builds from the user's own music folder (index,
+# cover art, play counts, the folder path). (touchHLE_options.txt stays
+# tracked: src/paths.rs embeds it as the template for new users, so keep
+# personal edits out of it.)
+/library/
 touchHLE_wallpaper.*
 
 # Sandboxed app data (save games etc). Personal + can be huge.

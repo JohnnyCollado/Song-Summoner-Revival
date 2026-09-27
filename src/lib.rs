@@ -44,6 +44,7 @@ mod libc;
 mod licenses;
 mod mach_o;
 mod matrix;
+mod media;
 mod mem;
 mod objc;
 mod options;
@@ -359,6 +360,13 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     for option_arg in option_args {
         let parse_result = options.parse_argument(&option_arg);
         assert!(parse_result == Ok(true));
+    }
+
+    // The folder dialog has to come before the SDL window, and the scan runs
+    // on its own thread while the app boots.
+    #[cfg(not(target_os = "android"))]
+    if options.music_library && !options.headless {
+        media::scan_windows::prepare(options.choose_music_folder);
     }
 
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -3,33 +3,34 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-//! `MPMediaItem` plus a small built-in "library" of fake songs.
-//!
-//! touchHLE has no real iPod music library, but apps like Song Summoner are
-//! built entirely around iterating it. We expose a handful of synthetic songs
-//! here so those apps see something to summon/charge with instead of an empty
-//! library state.
+//! `MPMediaItem` and `MPMediaItemArtwork`.
 
 use crate::dyld::{ConstantExports, HostConstant};
-use crate::frameworks::foundation::{ns_array, ns_string, NSUInteger};
+use crate::frameworks::core_graphics::cg_image::{self, CGImageRelease};
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+use crate::frameworks::foundation::ns_string;
+use crate::media::library;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, ClassExports, HostObject, NSZonePtr,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    NSZonePtr,
 };
 use crate::Environment;
+use std::collections::HashMap;
 
-// Property key strings. Apps pass these to `-[MPMediaItem valueForProperty:]`.
+// Property keys, with the values real iPhone OS uses.
 pub const MPMediaItemPropertyPersistentID: &str = "persistentID";
+pub const MPMediaItemPropertyMediaType: &str = "mediaType";
 pub const MPMediaItemPropertyTitle: &str = "title";
-pub const MPMediaItemPropertyArtist: &str = "artist";
 pub const MPMediaItemPropertyAlbumTitle: &str = "albumTitle";
+pub const MPMediaItemPropertyArtist: &str = "artist";
 pub const MPMediaItemPropertyAlbumArtist: &str = "albumArtist";
 pub const MPMediaItemPropertyGenre: &str = "genre";
 pub const MPMediaItemPropertyPlaybackDuration: &str = "playbackDuration";
-pub const MPMediaItemPropertyPlayCount: &str = "playCount";
+pub const MPMediaItemPropertyAlbumTrackNumber: &str = "albumTrackNumber";
 pub const MPMediaItemPropertyArtwork: &str = "artwork";
-
+pub const MPMediaItemPropertyPlayCount: &str = "playCount";
+pub const MPMediaPlaylistPropertyPersistentID: &str = "playlistPersistentID";
 pub const MPMediaPlaylistPropertyName: &str = "name";
-pub const MPMediaPlaylistPropertyPersistentID: &str = "persistentID";
 
 pub const CONSTANTS: ConstantExports = &[
     (
@@ -37,16 +38,20 @@ pub const CONSTANTS: ConstantExports = &[
         HostConstant::NSString(MPMediaItemPropertyPersistentID),
     ),
     (
+        "_MPMediaItemPropertyMediaType",
+        HostConstant::NSString(MPMediaItemPropertyMediaType),
+    ),
+    (
         "_MPMediaItemPropertyTitle",
         HostConstant::NSString(MPMediaItemPropertyTitle),
     ),
     (
-        "_MPMediaItemPropertyArtist",
-        HostConstant::NSString(MPMediaItemPropertyArtist),
-    ),
-    (
         "_MPMediaItemPropertyAlbumTitle",
         HostConstant::NSString(MPMediaItemPropertyAlbumTitle),
+    ),
+    (
+        "_MPMediaItemPropertyArtist",
+        HostConstant::NSString(MPMediaItemPropertyArtist),
     ),
     (
         "_MPMediaItemPropertyAlbumArtist",
@@ -61,35 +66,115 @@ pub const CONSTANTS: ConstantExports = &[
         HostConstant::NSString(MPMediaItemPropertyPlaybackDuration),
     ),
     (
-        "_MPMediaItemPropertyPlayCount",
-        HostConstant::NSString(MPMediaItemPropertyPlayCount),
+        "_MPMediaItemPropertyAlbumTrackNumber",
+        HostConstant::NSString(MPMediaItemPropertyAlbumTrackNumber),
     ),
     (
         "_MPMediaItemPropertyArtwork",
         HostConstant::NSString(MPMediaItemPropertyArtwork),
     ),
     (
-        "_MPMediaPlaylistPropertyName",
-        HostConstant::NSString(MPMediaPlaylistPropertyName),
+        "_MPMediaItemPropertyPlayCount",
+        HostConstant::NSString(MPMediaItemPropertyPlayCount),
     ),
     (
         "_MPMediaPlaylistPropertyPersistentID",
         HostConstant::NSString(MPMediaPlaylistPropertyPersistentID),
     ),
+    (
+        "_MPMediaPlaylistPropertyName",
+        HostConstant::NSString(MPMediaPlaylistPropertyName),
+    ),
 ];
 
-use super::music_library;
-use std::collections::HashMap;
+/// `MPMediaTypeMusic`.
+const MEDIA_TYPE_MUSIC: u32 = 1;
+
+#[derive(Default)]
+pub(super) struct State {
+    /// One `MPMediaItem` per persistent ID, made on first use and never
+    /// freed. Song Summoner keeps pointers to items it never retained (the
+    /// old implementation crashed on those once an autorelease pool drained
+    /// them), and a real iPod library also hands out the same object for
+    /// the same song. Each holds one retain from this map.
+    items: HashMap<u64, id>,
+}
 
 struct MPMediaItemHostObject {
-    song_index: usize,
-    /// Property values cached on first read, each entry holds a retain. The
-    /// game caches references to these (e.g. song titles in cell labels);
-    /// without a long-lived retain on our side those strings get released
-    /// when the autorelease pool drains and the game blows up later.
-    cached_values: HashMap<String, id>,
+    persistent_id: u64,
+    /// Property values handed out so far, each retained. The game stores
+    /// some (e.g. titles for its panel) without retaining them, so they
+    /// have to outlive the autorelease pool, like the item itself.
+    values: HashMap<String, id>,
 }
 impl HostObject for MPMediaItemHostObject {}
+
+struct MPMediaItemArtworkHostObject {
+    persistent_id: u64,
+}
+impl HostObject for MPMediaItemArtworkHostObject {}
+
+/// The `MPMediaItem` for a song. The caller doesn't own it (it lives
+/// forever, see [State::items]).
+pub fn item_for_id(env: &mut Environment, persistent_id: u64) -> id {
+    if let Some(&item) = env
+        .framework_state
+        .media_player
+        .media_item
+        .items
+        .get(&persistent_id)
+    {
+        return item;
+    }
+    let class = env.objc.get_known_class("MPMediaItem", &mut env.mem);
+    let item = env.objc.alloc_object(
+        class,
+        Box::new(MPMediaItemHostObject {
+            persistent_id,
+            values: HashMap::new(),
+        }),
+        &mut env.mem,
+    );
+    env.framework_state
+        .media_player
+        .media_item
+        .items
+        .insert(persistent_id, item);
+    item
+}
+
+/// The persistent ID of an `MPMediaItem`, or 0 if `item` isn't one of ours.
+pub fn persistent_id_of(env: &mut Environment, item: id) -> u64 {
+    if item == nil {
+        return 0;
+    }
+    let class = env.objc.get_known_class("MPMediaItem", &mut env.mem);
+    let item_class = msg![env; item class];
+    if !env.objc.class_is_subclass_of(item_class, class) {
+        return 0;
+    }
+    env.objc.borrow::<MPMediaItemHostObject>(item).persistent_id
+}
+
+/// A `UIImage` (autoreleased) of a song's cover art, or nil.
+pub fn artwork_image(env: &mut Environment, persistent_id: u64) -> id {
+    let Some(bytes) = crate::media::artwork::load_png_bytes(persistent_id) else {
+        return nil;
+    };
+    let Ok(image) = crate::image::Image::from_bytes(&bytes) else {
+        log!("media: unreadable art for {:016X}", persistent_id);
+        return nil;
+    };
+    let cg_image = cg_image::from_image(env, image);
+    let ui_image: id = msg_class![env; UIImage alloc];
+    let ui_image: id = msg![env; ui_image initWithCGImage:cg_image];
+    CGImageRelease(env, cg_image);
+    autorelease(env, ui_image)
+}
+
+fn number_u64(env: &mut Environment, value: u64) -> id {
+    msg_class![env; NSNumber numberWithUnsignedLongLong:value]
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -101,167 +186,148 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(
         this,
         Box::new(MPMediaItemHostObject {
-            song_index: 0,
-            cached_values: HashMap::new(),
+            persistent_id: 0,
+            values: HashMap::new(),
         }),
         &mut env.mem,
     )
 }
 
 - (())dealloc {
-    let cached = std::mem::take(
-        &mut env.objc.borrow_mut::<MPMediaItemHostObject>(this).cached_values,
+    let values = std::mem::take(
+        &mut env.objc.borrow_mut::<MPMediaItemHostObject>(this).values,
     );
-    for (_, v) in cached {
-        crate::objc::release(env, v);
+    for (_, value) in values {
+        release(env, value);
     }
-    env.objc.dealloc_object(this, &mut env.mem);
+    env.objc.dealloc_object(this, &mut env.mem)
 }
 
-- (id)valueForProperty:(id)property {
+- (u64)persistentID {
+    env.objc.borrow::<MPMediaItemHostObject>(this).persistent_id
+}
+
+- (id)valueForProperty:(id)property { // NSString*
+    if property == nil {
+        return nil;
+    }
     let key = ns_string::to_rust_string(env, property).to_string();
-    let idx_for_log = env.objc.borrow::<MPMediaItemHostObject>(this).song_index;
-    log!(
-        "MPMediaItem {:?} (song_index={}) valueForProperty:'{}'",
-        this, idx_for_log, key
-    );
-    // Return cached value (autoreleased copy of the retain we hold) if any.
+    let pid = env.objc.borrow::<MPMediaItemHostObject>(this).persistent_id;
+
+    // Play counts change while the app runs, so they're never cached.
+    if key == MPMediaItemPropertyPlayCount {
+        let count = crate::media::playcount::get(pid);
+        return msg_class![env; NSNumber numberWithUnsignedInt:count];
+    }
+
     if let Some(&cached) = env
         .objc
         .borrow::<MPMediaItemHostObject>(this)
-        .cached_values
+        .values
         .get(&key)
     {
-        if cached == nil { return nil; }
-        crate::objc::retain(env, cached);
-        return autorelease(env, cached);
+        return cached;
     }
-    let idx = env.objc.borrow::<MPMediaItemHostObject>(this).song_index;
-    let Some(song) = music_library::song(idx) else {
+
+    let library = library::current();
+    let Some(song) = library.get(pid) else {
+        log!("media: item {:016X} is no longer in the library", pid);
         return nil;
     };
-    // Build the value. NSNumber factories return an autoreleased object
-    // (retain=1, pool entry pending). ns_string::from_rust_string returns
-    // a non-autoreleased object (retain=1, no pool entry). Normalize so all
-    // branches end with retain=1 + one pending autorelease — that way the
-    // caching logic below can be symmetric.
+    let text = |env: &mut Environment, s: &str| {
+        let string = ns_string::from_rust_string(env, s.to_string());
+        autorelease(env, string)
+    };
     let value: id = match key.as_str() {
-        MPMediaItemPropertyPersistentID => {
-            msg_class![env; NSNumber numberWithUnsignedLongLong:(song.persistent_id)]
+        MPMediaItemPropertyPersistentID => number_u64(env, pid),
+        MPMediaItemPropertyMediaType => {
+            msg_class![env; NSNumber numberWithUnsignedInt:MEDIA_TYPE_MUSIC]
         }
-        MPMediaItemPropertyTitle | "name" => {
-            let v = ns_string::from_rust_string(env, song.title.clone());
-            autorelease(env, v)
-        }
-        MPMediaItemPropertyArtist => {
-            let v = ns_string::from_rust_string(env, song.artist.clone());
-            autorelease(env, v)
-        }
-        MPMediaItemPropertyAlbumTitle => {
-            let v = ns_string::from_rust_string(env, song.album.clone());
-            autorelease(env, v)
-        }
+        MPMediaItemPropertyTitle => text(env, &song.title),
+        MPMediaItemPropertyArtist => text(env, &song.artist),
+        MPMediaItemPropertyAlbumTitle => text(env, &song.album),
         MPMediaItemPropertyAlbumArtist => {
-            let v = ns_string::from_rust_string(env, song.artist.clone());
-            autorelease(env, v)
+            let album_artist = if song.album_artist.is_empty() {
+                &song.artist
+            } else {
+                &song.album_artist
+            };
+            text(env, album_artist)
         }
-        MPMediaItemPropertyGenre => {
-            let v = ns_string::from_rust_string(env, song.genre.clone());
-            autorelease(env, v)
-        }
-        MPMediaItemPropertyPlayCount => {
-            msg_class![env; NSNumber numberWithUnsignedInt:(song.play_count)]
-        }
+        MPMediaItemPropertyGenre => text(env, &song.genre),
         MPMediaItemPropertyPlaybackDuration => {
-            msg_class![env; NSNumber numberWithDouble:(song.duration_secs)]
+            let seconds = song.duration_secs();
+            msg_class![env; NSNumber numberWithDouble:seconds]
         }
-        MPMediaItemPropertyArtwork => nil,
+        MPMediaItemPropertyAlbumTrackNumber => {
+            let track = song.track;
+            msg_class![env; NSNumber numberWithUnsignedInt:track]
+        }
+        MPMediaItemPropertyArtwork => {
+            if !song.has_art {
+                return nil;
+            }
+            let artwork: id = msg_class![env; MPMediaItemArtwork alloc];
+            env.objc
+                .borrow_mut::<MPMediaItemArtworkHostObject>(artwork)
+                .persistent_id = pid;
+            autorelease(env, artwork)
+        }
         _ => {
-            log_dbg!("[(MPMediaItem*){:?} valueForProperty:'{}'] -> nil (unknown)", this, key);
+            log!("TODO: [(MPMediaItem*){:?} valueForProperty:{:?}] -> nil", this, key);
             nil
         }
     };
-    // `value` is now uniformly autoreleased (retain=1, pool entry pending).
-    // To keep a strong reference in the cache, retain once more (count=2),
-    // then return the value as-is — its existing pool entry will balance
-    // the caller's auto-release expectation. After the pool drains, the
-    // cached entry retains count=1. (Was: previously did an extra
-    // `autorelease(env, value)` here which caused a double-release of
-    // already-autoreleased NSNumber properties, crashing on stale pointers
-    // when the cache was later read.)
     if value != nil {
-        crate::objc::retain(env, value);
+        retain(env, value);
         env.objc
             .borrow_mut::<MPMediaItemHostObject>(this)
-            .cached_values
+            .values
             .insert(key, value);
-        value
-    } else {
-        env.objc
-            .borrow_mut::<MPMediaItemHostObject>(this)
-            .cached_values
-            .insert(key, nil);
-        nil
     }
+    value
+}
+
+@end
+
+@implementation MPMediaItemArtwork: NSObject
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(
+        this,
+        Box::new(MPMediaItemArtworkHostObject { persistent_id: 0 }),
+        &mut env.mem,
+    )
+}
+
+// The stored art is at most 256x256; UIKit scales it to whatever size the
+// app draws it at.
+- (id)imageWithSize:(CGSize)_size {
+    let pid = env.objc.borrow::<MPMediaItemArtworkHostObject>(this).persistent_id;
+    artwork_image(env, pid)
+}
+
+- (CGRect)bounds {
+    let pid = env.objc.borrow::<MPMediaItemArtworkHostObject>(this).persistent_id;
+    let size = crate::media::artwork::load(pid)
+        .map(|b| CGSize {
+            width: b.width as f32,
+            height: b.height as f32,
+        })
+        .unwrap_or(CGSize {
+            width: 0.0,
+            height: 0.0,
+        });
+    CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size,
+    }
+}
+
+- (CGRect)imageCropRect {
+    msg![env; this bounds]
 }
 
 @end
 
 };
-
-/// Build an autoreleased `NSArray*` of the `MPMediaQuery`-exposed subset of
-/// the music library (see [music_library::query_song_count]). Each
-/// `MPMediaItem` is owned by the array (not also in the autorelease pool),
-/// matching the "retained by the Vec" contract of [ns_array::from_vec].
-pub fn make_items_array(env: &mut Environment) -> id {
-    let count = music_library::query_song_count();
-    let mut objs: Vec<id> = Vec::with_capacity(count);
-    for i in 0..count {
-        objs.push(make_item_owned(env, i));
-    }
-    let arr = ns_array::from_vec(env, objs);
-    autorelease(env, arr)
-}
-
-/// Create one `MPMediaItem` for the song at `index`, with the caller taking
-/// ownership of the initial retain (no autorelease).
-pub fn make_item_owned(env: &mut Environment, index: usize) -> id {
-    // Re-use the same MPMediaItem instance for each library song. Song
-    // Summoner's pick handling stashes raw pointers to picked items in C++
-    // structures we can't see; without a stable identity those pointers
-    // dangle the moment our autorelease pool drains the array that held
-    // them, and the next msg_send crashes with `orig_class != nil`. Cache
-    // by song_index, hand out an extra retain on every call, and never
-    // release — items leak but the game stays alive.
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static CACHE: Mutex<Option<HashMap<usize, id>>> = Mutex::new(None);
-    {
-        let mut guard = CACHE.lock().unwrap();
-        let map = guard.get_or_insert_with(HashMap::new);
-        if let Some(&existing) = map.get(&index) {
-            // Bump retain so the caller can release without freeing.
-            crate::objc::retain(env, existing);
-            return existing;
-        }
-    }
-    let cls = env.objc.get_known_class("MPMediaItem", &mut env.mem);
-    let item: id = msg![env; cls alloc];
-    env.objc
-        .borrow_mut::<MPMediaItemHostObject>(item)
-        .song_index = index;
-    // Extra retain to keep the item alive for the lifetime of the process —
-    // the game's stale pointer needs a valid object to receive msg_sends.
-    crate::objc::retain(env, item);
-    {
-        let mut guard = CACHE.lock().unwrap();
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(index, item);
-    }
-    item
-}
-
-#[allow(dead_code)]
-pub fn song_count() -> NSUInteger {
-    music_library::song_count() as NSUInteger
-}

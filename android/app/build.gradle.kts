@@ -369,4 +369,7 @@ dependencies {
     implementation(fileTree("libs") {
         include("*.jar")
     })
+    // Plain JVM unit tests (src/test/) for logic that doesn't need a
+    // device, e.g. LibraryScanner's pure helpers.
+    testImplementation("junit:junit:4.13.2")
 }

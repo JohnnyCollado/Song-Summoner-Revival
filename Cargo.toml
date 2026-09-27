@@ -85,30 +85,44 @@ nibarchive = "0.1.0"
 libc = "0.2.180"
 corosensei = "0.3.2"
 uuid = { version = "1.2.2", default-features = false, features = ["v4"] }
-# Audio metadata reader so the simulated iPod library can surface real song
-# titles (ID3v2 / iTunes M4A / FLAC / Vorbis) instead of the bare filename.
-lofty = { version = "0.21", default-features = false }
-# Native folder picker for the music-library setup so users can point
-# touchHLE at a real folder of audio files. rfd doesn't build for Android
-# (no native folder picker there); on Android we fall back to scanning the
-# app's external-files dir (see music_library.rs / saved_library_path),
-# so the runtime never calls into rfd on that platform.
-#
-# rodio is also excluded on Android: cpal's Android backend is oboe, which
-# requires `ndk_context::initialize_android_context()` to be called first
-# (it isn't -- touchHLE doesn't wire JNI through ndk-context), so the first
-# oboe call panics with "android context was not initialized". The picker
-# preview audio is the only user of rodio, and `play_song`/`stop_song_preview`
-# are stubbed to no-ops on Android in music_library.rs.
+# zlib compression for the PNG cover-art cache the desktop music scanner
+# writes (src/media/artwork.rs). zip already depends on it.
+flate2 = "1.0.25"
+
+# The desktop music scanner (src/media/scan_windows.rs). Android scans with
+# the Storage Access Framework in Kotlin instead (LibraryScanner.kt), so
+# neither crate is built there.
 [target.'cfg(not(target_os = "android"))'.dependencies]
+# Song tags and embedded cover art (ID3v2, iTunes M4A, RIFF INFO).
+lofty = { version = "0.21", default-features = false }
+# The native "Select folder" dialog for choosing the music folder.
 rfd = { version = "0.15.4", default-features = false }
-# Plays the picked song to the host's default audio output so the picker
-# experience matches a real iPod: tap a row, hear the track. Uses its own
-# cpal backend independently of the guest OpenAL pipeline.
-rodio = { version = "0.20", default-features = false, features = ["mp3", "wav", "flac", "vorbis", "symphonia-aac", "symphonia-isomp4"] }
+
+# Android: songs picked with the Storage Access Framework are content://
+# URIs, so the engine asks Kotlin (MusicFiles.openFd) for a file descriptor
+# over JNI (src/media/source.rs).
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21.1", default-features = false }
 
 [build-dependencies]
 cargo-license = "0.5.1"
 cc = { workspace = true }
 cmake = { workspace = true }
 gl_generator = { workspace = true }
+
+# Unoptimized, touchHLE is too slow to play, and scanning a music library
+# spends minutes decoding and resizing cover art. So debug builds
+# (`cargo debug-windows`, `cargo test`) still optimize, while keeping
+# debug info, debug assertions and overflow checks for backtraces:
+# - touchHLE and its in-tree wrapper crates lightly (level 1 still steps
+#   sensibly in a debugger). This also reaches the C/C++ they build: cc
+#   passes it on as -O1, and CMake builds dynarmic (the CPU emulator) and
+#   OpenAL Soft as RelWithDebInfo instead of Debug.
+# - Third-party crates fully (flate2, lofty, ...), since nobody debugs
+#   into them. They're compiled once, so it only slows the first build.
+# Release builds and the Android APK (always release Rust) are unaffected.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

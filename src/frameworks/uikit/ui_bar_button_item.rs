@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 //! Minimal `UIBarItem`, `UIBarButtonItem`. Enough for apps that wire up a
-//! Cancel/Done button on a navigation bar (Song Summoner's picker does this).
+//! Cancel/Done button on a navigation bar.
 
 use crate::frameworks::foundation::NSInteger;
 use crate::objc::{

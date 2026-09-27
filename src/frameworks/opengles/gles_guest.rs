@@ -935,36 +935,9 @@ fn glGenTextures(env: &mut Environment, n: GLsizei, textures: MutPtr<GLuint>) {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let textures = mem.ptr_at_mut(textures, n_usize);
         unsafe { gles.GenTextures(n, textures) }
-    });
-    // INSTRUMENTATION: track texture lifecycle so we can correlate
-    // creation/deletion with pick cycles. We read back the IDs that
-    // GenTextures assigned and register them with the picker's tracker.
-    if n > 0 {
-        let n_usize: GuestUSize = n as GuestUSize;
-        let mut ids = Vec::with_capacity(n as usize);
-        for i in 0..n_usize {
-            let p: ConstPtr<GLuint> = Ptr::from_bits(textures.to_bits() + i * 4);
-            ids.push(env.mem.read(p));
-        }
-        crate::frameworks::uikit::ui_view::ui_table_view::track_gl_textures_gen(&ids);
-    }
+    })
 }
-
 fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint>) {
-    // INSTRUMENTATION: record IDs + caller LR for natural teardown
-    // identification. The function that calls glDeleteTextures during
-    // a Back→Soul Master→re-enter cycle IS the iPod scene destructor.
-    let lr = env.cpu.regs()[crate::cpu::Cpu::LR];
-    if n > 0 {
-        let n_usize: GuestUSize = n as GuestUSize;
-        let mut ids = Vec::with_capacity(n as usize);
-        for i in 0..n_usize {
-            let p: ConstPtr<GLuint> = Ptr::from_bits(textures.to_bits() + i * 4);
-            ids.push(env.mem.read(p));
-        }
-        log!("[gl_tex] glDeleteTextures n={} caller_lr={:#x} ids={:?}", n, lr, ids);
-        crate::frameworks::uikit::ui_view::ui_table_view::track_gl_textures_delete(&ids);
-    }
     with_ctx_and_mem(env, |gles, mem| {
         let n_usize: GuestUSize = n.try_into().unwrap();
         let textures = mem.ptr_at(textures, n_usize);

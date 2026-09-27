@@ -14,13 +14,11 @@ import android.system.Os
 import android.util.Log
 import org.libsdl.app.SDLActivity
 import java.io.File
-import java.io.FileOutputStream
-import java.io.IOException
 
 // A wrapper class over SDLActivity that points touchHLE at its public
 // user-data folder and, in the wrapper flavor, at the game IPA.
 //
-// All interactive setup (storage permission, music-folder picker) happens
+// All interactive setup (storage permission, IPA, music folder) happens
 // earlier, in SetupActivity: touchHLE exits the process whenever it loses
 // focus, so nothing here may open another activity.
 class MainActivity : SDLActivity() {
@@ -33,8 +31,6 @@ class MainActivity : SDLActivity() {
         // before super so the Rust side picks it up on first lookup.
         private const val ENV_USER_DATA_BASE_PATH =
             "TOUCHHLE_USER_DATA_BASE_PATH"
-
-        private const val ALBUM_PLACEHOLDER = "album_placeholder.png"
     }
 
     // Resolved public user-data folder for this flavor.
@@ -76,11 +72,9 @@ class MainActivity : SDLActivity() {
                 return
             }
         }
-        // Extract the album-art placeholder bundled in assets to the
-        // user-data folder so the Rust runtime can fs::read it. Safe to
-        // call every launch -- it's a no-op when the file is already
-        // present at the right size.
-        ensureAlbumPlaceholderUnpacked()
+        // The engine opens the user's songs through this (over JNI) once it
+        // is running.
+        MusicFiles.init(this)
         super.onCreate(savedInstanceState)
     }
 
@@ -121,64 +115,6 @@ class MainActivity : SDLActivity() {
         Log.w(TAG, "wrapper: IPA not found at ${ipa.absolutePath}" +
             " -- returning to setup.")
         return null
-    }
-
-    // Copy assets/album_placeholder.png into the user-data folder under
-    // res/album_placeholder.png so touchHLE's Rust loader (which does a
-    // plain fs::read("res/album_placeholder.png") keyed off
-    // user_data_base_path on Android) can find it. We write to BOTH
-    // candidate locations the Rust paths logic might resolve to:
-    //   - <userDataDir>/res/      (preferred; only writable once the
-    //                              user grants MANAGE_EXTERNAL_STORAGE)
-    //   - getExternalFilesDir/res (always writable; fallback the Rust
-    //                              side falls back to as well)
-    // That way the file is in place before *or* after the user grants
-    // "All files access" -- whichever Rust resolves to, it'll find it.
-    // Idempotent: skips the copy when the destination already exists
-    // with the expected byte count.
-    private fun ensureAlbumPlaceholderUnpacked() {
-        val expectedSize: Long = try {
-            assets.openFd(ALBUM_PLACEHOLDER).use { it.length }
-        } catch (e: IOException) {
-            // Asset is markCompressed by default; openFd fails for
-            // compressed assets. Fall back to streaming through open()
-            // and count bytes ourselves.
-            try {
-                assets.open(ALBUM_PLACEHOLDER).use { input ->
-                    val buf = ByteArray(64 * 1024)
-                    var n = 0L
-                    while (true) {
-                        val r = input.read(buf)
-                        if (r <= 0) break
-                        n += r
-                    }
-                    n
-                }
-            } catch (e2: IOException) {
-                Log.w(TAG, "$ALBUM_PLACEHOLDER asset missing: $e2")
-                return
-            }
-        }
-        val targets = mutableListOf(File("$userDataDir/res/$ALBUM_PLACEHOLDER"))
-        getExternalFilesDir(null)?.let {
-            targets.add(File(it, "res/$ALBUM_PLACEHOLDER"))
-        }
-        for (dest in targets) {
-            if (dest.isFile && dest.length() == expectedSize) continue
-            dest.parentFile?.mkdirs()
-            try {
-                assets.open(ALBUM_PLACEHOLDER).use { input ->
-                    FileOutputStream(dest).use { out -> input.copyTo(out) }
-                }
-                Log.i(TAG, "Extracted $ALBUM_PLACEHOLDER -> ${dest.absolutePath}")
-            } catch (e: IOException) {
-                // Permission-denied on the public user-data dir before
-                // MANAGE_EXTERNAL_STORAGE is granted is normal -- the
-                // fallback ext-files path will succeed.
-                Log.i(TAG, "Could not extract $ALBUM_PLACEHOLDER to " +
-                    "${dest.absolutePath}: $e")
-            }
-        }
     }
 
     override fun getLibraries(): Array<String> = arrayOf("SDL2", "touchHLE")

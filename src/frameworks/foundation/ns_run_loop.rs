@@ -442,15 +442,6 @@ pub fn run_run_loop(
             media_player::handle_players(env);
             uikit::ui_view::ui_image_view::handle_animations(env);
             uikit::ui_view::handle_pending_animation_callbacks(env);
-            // Drain any deferred picker-swap (currently disabled — the
-            // touch handler dispatches synchronously again. Kept for
-            // possible future deferred work.)
-            uikit::ui_view::ui_table_view::drain_pending_picker_swap(env);
-            // Per-tick iPod scene observer (read-only). Logs scene-table
-            // entry 5 (iPod scene) state + MainLoop state on each change.
-            // Goal: catch the exact tick where scene+0xc reaches 9 on
-            // pick 1, and identify why pick 2 never returns there.
-            uikit::ui_view::ui_table_view::observe_ipod_scene_tick(env);
         }
 
         // Unfortunately, touchHLE has to poll for certain things repeatedly;

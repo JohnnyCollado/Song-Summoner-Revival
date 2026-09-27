@@ -187,6 +187,38 @@ Skip the integration tests that need the bundled test app:
 cargo test -- --skip run_test_app
 ```
 
+### Music library and picker unit tests
+
+These need no device, no IPA and no music folder. Library index, sorting,
+grouping, play counts and cover art (fixture in `tests\fixtures\library\`):
+
+```bash
+cargo test --lib media::
+```
+
+The Windows scanner on its own: reuse of unchanged files, index order with
+parallel reads, a crashing file costing only its own song, and listing a
+real temporary folder. A passing run still prints one "malformed tag"
+panic; that's the crash test's deliberate panic being caught:
+
+```bash
+cargo test --lib scan_windows::
+```
+
+The picker: drawing primitives, layout, and which fighter portrait each
+song gets:
+
+```bash
+cargo test --lib song_summoner::
+```
+
+The Android scanner's pure helpers (currently the read-thread count). JVM
+only, no device needed:
+
+```bash
+.\android\gradlew.bat -p android :app:testSongsummonerDebugUnitTest
+```
+
 Format the code. `rustfmt` doesn't understand the `objc_classes!` / `msg!`
 macros, so check those by hand afterwards:
 
@@ -202,7 +234,86 @@ cargo clippy -- --deny warnings
 
 ---
 
-## 6. Device helpers (adb)
+## 6. Music library scan checks (run from the repo root)
+
+Each scan ends with one log line that says how many files were read and
+where the time went:
+
+```
+media: scanned 1388 songs (1388 read, 0 unchanged) in 5592 ms: list 460 ms, read 5027 ms on 8 threads (summed: tags 27480 ms, art 12491 ms), write 101 ms
+```
+
+- **clean scan:** delete the index first, so every file is read. This is
+  what a first run or a big import costs.
+- **incremental scan:** launch again without deleting anything. It should
+  say `0 read, N unchanged` and take well under a second. If it reads
+  everything again, unchanged files aren't being recognised: that's a bug.
+- `tags` and `art` are summed over all read threads, so they can exceed the
+  total.
+- The index is only written when a scan finishes. Quitting mid-scan throws
+  the work away, and the next launch starts clean again.
+
+Reference numbers (OnePlus 8T, 1388 songs): clean 5.6 s, incremental
+0.57 s.
+
+### Android
+
+Clean scan: delete the index, launch, and wait until the game is up:
+
+```bash
+adb shell "rm -f /sdcard/SongSummoner/library/index.tsv"
+```
+
+```bash
+adb shell monkey -p com.sqefam.songsummoner 1
+```
+
+Read the result:
+
+```bash
+adb logcat -d -s touchHLE | Select-String "media: (found|scanned)"
+```
+
+Incremental scan: force-stop, launch again, and read the result the same
+way:
+
+```bash
+adb shell am force-stop com.sqefam.songsummoner
+```
+
+```bash
+adb shell monkey -p com.sqefam.songsummoner 1
+```
+
+The newest `scanned` line is the latest launch.
+
+### Windows
+
+Clean scan: delete the index, then run the game and leave it running
+until the picker's loading screen has gone. If no scan has ever
+finished, there's no index yet, and this does nothing:
+
+```bash
+Remove-Item .\debug\windows\library\index.tsv -ErrorAction SilentlyContinue
+```
+
+```bash
+Start-Process -NoNewWindow -Wait -FilePath .\debug\windows\touchHLE.exe -WorkingDirectory .\debug\windows -ArgumentList "`"$PWD\apps\Song Summoner The Unsung Heroes Encore.ipa`""
+```
+
+Read the result. The log is rewritten on every launch, so check it before
+starting the next run:
+
+```bash
+Select-String -Path .\debug\windows\touchHLE_log.txt -Pattern "media: (found|scanned)"
+```
+
+Incremental scan: run the same `Start-Process` command again and read the
+log the same way.
+
+---
+
+## 7. Device helpers (adb)
 
 These work from any folder. Swap in `org.touchhle.android` and
 `/sdcard/touchHLE/` for the touchHLE flavor.
@@ -251,10 +362,16 @@ current folder:
 adb pull /sdcard/SongSummoner/touchHLE_log.txt
 ```
 
-Check which music folder the picker is using:
+Check which music folder the library is read from (a SAF tree URI):
 
 ```bash
-adb shell cat /sdcard/SongSummoner/touchHLE_music_library.txt
+adb shell cat /sdcard/SongSummoner/library/source.txt
+```
+
+List the library index and the cover-art cache:
+
+```bash
+adb shell "ls -l /sdcard/SongSummoner/library /sdcard/SongSummoner/library/art | head -20"
 ```
 
 Delete the IPA from the device, e.g. to test the first-run import again:

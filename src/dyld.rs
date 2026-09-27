@@ -295,6 +295,8 @@ impl Dyld {
 
         objc.register_bin_classes(&bins[0], mem);
         objc.register_bin_categories(&bins[0], mem);
+        // After the categories, which could otherwise replace an override.
+        objc.apply_app_overrides(&bins[0], mem);
 
         ns_string::register_constant_strings(&bins[0], mem, objc);
     }

@@ -4,18 +4,22 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 //! The Media Player framework.
+//!
+//! The iPod library classes (`MPMediaQuery`, `MPMediaItem` and friends) are
+//! backed by the user's own music, read from the library index by
+//! [crate::media], and `MPMusicPlayerController` plays it. Only what apps
+//! actually call is implemented; anything else logs.
 
 mod media_entity;
-pub(crate) mod media_item;
-pub(crate) mod media_item_collection;
+pub mod media_item;
+pub mod media_item_collection;
 mod media_library;
-pub(crate) mod media_picker_controller;
+mod media_picker_controller;
 mod media_playlist;
 mod media_property_predicate;
 mod media_query;
 mod movie_player;
-pub(crate) mod music_library;
-mod music_player;
+pub mod music_player;
 
 pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     path: "/System/Library/Frameworks/MediaPlayer.framework/MediaPlayer",
@@ -36,6 +40,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         movie_player::CONSTANTS,
         music_player::CONSTANTS,
         media_item::CONSTANTS,
+        media_library::CONSTANTS,
     ],
     function_exports: &[],
 };
@@ -43,13 +48,13 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 #[derive(Default)]
 pub struct State {
     movie_player: movie_player::State,
-    media_picker: media_picker_controller::State,
-    media_library: media_library::State,
+    media_item: media_item::State,
+    music_player: music_player::State,
 }
 
 /// For use by `NSRunLoop`: check media players' status, send notifications if
 /// necessary.
 pub fn handle_players(env: &mut crate::Environment) {
     movie_player::handle_players(env);
-    media_picker_controller::handle_players(env);
+    music_player::handle_players(env);
 }

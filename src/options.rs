@@ -63,6 +63,11 @@ pub struct Options {
     pub dumping_file: PathBuf,
     pub ignore_gl_errors: bool,
     pub zero_stack_after_guest_to_host_call: Option<u32>,
+    /// Read a folder of the user's music into the MediaPlayer library at
+    /// boot (desktop only; Android does this in its setup screen).
+    pub music_library: bool,
+    /// Ask for the music folder again even if one was chosen before.
+    pub choose_music_folder: bool,
 }
 
 impl Default for Options {
@@ -97,6 +102,8 @@ impl Default for Options {
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
             zero_stack_after_guest_to_host_call: None,
+            music_library: false,
+            choose_music_folder: false,
         }
     }
 }
@@ -225,6 +232,11 @@ impl Options {
             self.gdb_listen_addrs = Some(addrs);
         } else if let Some(value) = arg.strip_prefix("--preferred-languages=") {
             self.preferred_languages = Some(value.split(',').map(ToOwned::to_owned).collect());
+        } else if arg == "--music-library" {
+            self.music_library = true;
+        } else if arg == "--choose-music-folder" {
+            self.music_library = true;
+            self.choose_music_folder = true;
         } else if arg == "--headless" {
             self.headless = true;
             // Can't show the dialog box when headless!

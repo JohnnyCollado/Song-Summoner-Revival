@@ -72,6 +72,8 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ui_view::ui_window::CLASSES,
         ui_view_controller::CLASSES,
         ui_view_controller::ui_navigation_controller::CLASSES,
+        // Song Summoner's music picker view (host-only, see the module).
+        crate::frameworks::song_summoner::CLASSES,
     ],
     constant_exports: &[
         ui_application::CONSTANTS,

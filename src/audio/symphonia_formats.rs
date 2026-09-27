@@ -5,7 +5,8 @@
  */
 //! Quick-and-dirty decoding of miscellaneous formats (MP3, AAC) to linear PCM.
 //!
-//! This should be the only module in touchHLE that makes use of [symphonia].
+//! Apart from the music player (`media::playback`), which streams, this
+//! should be the only module in touchHLE that makes use of [symphonia].
 //! For AAC, Only the LC profile and MPEG-4 container format are supported (see
 //! feature list in Cargo.toml).
 

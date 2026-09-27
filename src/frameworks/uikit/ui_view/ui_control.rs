@@ -17,7 +17,7 @@ pub mod ui_text_field;
 use crate::frameworks::core_graphics::CGPoint;
 use crate::frameworks::foundation::NSUInteger;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, msg_class, msg_send, msg_super, nil, objc_classes,
+    id, impl_HostObject_with_superclass, msg, msg_send, msg_super, nil, objc_classes,
     release, retain, ClassExports, NSZonePtr, SEL,
 };
 use crate::Environment;
@@ -254,35 +254,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let new_pos: CGPoint = msg![env; touch locationInView:this];
     let is_inside = msg![env; this pointInside:new_pos withEvent:event];
-
-    // Stop any picker-preview audio when the user taps a UIButton (or any
-    // UIControl) — typically the "Create Trooper" / "No" buttons on the
-    // post-pick confirmation screen, or any other game button that means
-    // "I'm done previewing this song." Mirrors how the real iPod picker
-    // stops playback when the user dismisses the picker.
-    if is_inside {
-        crate::frameworks::media_player::music_library::stop_song_preview();
-
-        // Route taps on our synthetic Y/N picker-confirmation overlay.
-        // The overlay buttons are tagged in
-        // `super::ui_table_view::show_pick_prompt`; on Y we attempt the
-        // game's song-pick dispatch, on N we just dismiss.
-        let tag: crate::frameworks::foundation::NSInteger =
-            msg![env; this tag];
-        const YES_TAG: crate::frameworks::foundation::NSInteger = 0x71_C_77;
-        const NO_TAG: crate::frameworks::foundation::NSInteger = 0x71_C_44;
-        if tag == YES_TAG || tag == NO_TAG {
-            let app: id = msg_class![env; UIApplication sharedApplication];
-            let window: id = msg![env; app keyWindow];
-            if tag == YES_TAG {
-                let pid = *super::ui_table_view::STAGED_PICK_PID.lock().unwrap();
-                super::ui_table_view::attempt_pick(env, pid);
-            }
-            if window != nil {
-                super::ui_table_view::hide_pick_prompt(env, window);
-            }
-        }
-    }
 
     // TODO: unclear if this is meant to be affected by tracking
     send_actions(env, this, event, match is_inside {

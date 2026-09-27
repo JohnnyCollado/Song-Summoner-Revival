@@ -405,13 +405,6 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let pool: id = msg_class![env; NSAutoreleasePool new];
 
-    // Capture this touch-up's iOS-canvas coordinates up front so we still
-    // have them after the for-loop below consumes `map`. Used by the
-    // post-dispatch classifier that decides whether to restore the picker
-    // (tap on No) or leave it hidden (tap on Create Trooper / elsewhere).
-    let touch_up_xy: Option<(f32, f32)> =
-        map.iter().next().map(|(_, c)| (c.0, c.1));
-
     let timestamp: NSTimeInterval = {
         let process_info = msg_class![env; NSProcessInfo processInfo];
         msg![env; process_info systemUptime]
@@ -487,170 +480,14 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     let event = ui_event::new_event(env, all_touches);
     autorelease(env, event);
 
-    // Snapshot the promoted picker table's hidden state and the touch
-    // coordinates, then classify the tap by location once dispatch
-    // returns. The Create Trooper / No screen is drawn by the game via
-    // OpenGL (not UIViews), so the only signal we have is where the user
-    // tapped on the simulated 480x320 touchscreen.
-    let promoted_table_pre: crate::objc::id = {
-        let bits = *crate::frameworks::uikit::ui_view::ui_table_view::PROMOTED_TABLE
-            .lock()
-            .unwrap();
-        match bits {
-            Some(b) => crate::objc::id::from_bits(b),
-            None => crate::objc::nil,
-        }
-    };
-    let was_hidden_pre: bool = if promoted_table_pre != crate::objc::nil {
-        msg![env; promoted_table_pre isHidden]
-    } else {
-        false
-    };
-
-    // Suppress touch dispatch entirely while the confirmation panel is up
-    // (was_hidden_pre = our promoted picker is hidden). The game renders
-    // the confirmation as cell 0 of IPDSongsTab — if we forwarded the
-    // touch normally, the cell would receive a tap and the game's
-    // didSelectRow would fire a SECOND time with row=0 (re-picking the
-    // wrong song). We only want our own classifier below to act on this
-    // touch, picking exactly one of: No / Create Trooper / no-op.
-    if !was_hidden_pre {
-        for (view, touches) in view_touches {
-            log_dbg!(
-                "Sending [{:?} touchesEnded:{:?} withEvent:{:?}]",
-                view,
-                touches,
-                event
-            );
-            let _: () = msg![env; view touchesEnded:touches withEvent:event];
-        }
-    } else {
+    for (view, touches) in view_touches {
         log_dbg!(
-            "ui_touch: suppressing dispatch for touch-up while picker is hidden (confirmation up)"
+            "Sending [{:?} touchesEnded:{:?} withEvent:{:?}]",
+            view,
+            touches,
+            event
         );
-    }
-
-    // Post-dispatch: if the table was hidden before this touch-up and the
-    // user tapped *on the No button* on the Create Trooper confirmation
-    // panel, restore the picker. Taps on Create Trooper (game progresses
-    // to next scene) or anywhere else (user still deciding) leave the
-    // picker hidden — the game covers it with its next scene anyway, and
-    // restoring on every tap would briefly flash the picker through other
-    // game screens.
-    //
-    // Bounds are in the 480x320 iOS-landscape canvas, calibrated from the
-    // confirmation-screen layout (see dev-docs notes / screenshot). Tweak
-    // here if the game's UI shifts.
-    // Calibrated from user-reported tap coords. The user pressed No at
-    // landscape y=238 and 227, both of which fall in what I'd initially
-    // estimated as the Create Trooper region. The dividing line between
-    // the two buttons is around y=225, not y=245 as the marked screenshot
-    // visually suggested. Bias towards No so it wins the boundary --
-    // pressing Create Trooper is destructive (game advances past picker),
-    // pressing No is recoverable.
-    // Hit-boxes calibrated by user-driven diagonal drags (logged via the
-    // touch-down + touch-up diagnostics). Measured edges:
-    //   Create Trooper: (268..473, 158..195)
-    //   No:             (266..471, 211..252)
-    // There's a 16px dead-zone between them (y=195..211). Bias the
-    // boundary toward No (extend it up into the gap) since Create Trooper
-    // dismisses the picker permanently and No is recoverable.
-    const CREATE_TROOPER_BOUNDS:   (f32, f32, f32, f32) = (262.0, 152.0, 478.0, 200.0);
-    const NO_BUTTON_BOUNDS:        (f32, f32, f32, f32) = (262.0, 200.0, 478.0, 258.0);
-    // Bottom-right back-icon — returns user to Soul Master (parent menu).
-    // Calibrated from user-reported taps at landscape (471, 312) and (457, 293).
-    const BACK_BUTTON_BOUNDS:      (f32, f32, f32, f32) = (440.0, 270.0, 480.0, 320.0);
-    fn in_rect(p: (f32, f32), r: (f32, f32, f32, f32)) -> bool {
-        p.0 >= r.0 && p.0 <= r.2 && p.1 >= r.1 && p.1 <= r.3
-    }
-    if promoted_table_pre != crate::objc::nil && was_hidden_pre {
-        let still_hidden: bool = msg![env; promoted_table_pre isHidden];
-        if still_hidden {
-            // The user was on the confirmation panel (picker hidden) when
-            // this touch landed. Stop any leftover song preview now,
-            // regardless of where on the panel they tapped -- the artwork,
-            // the dialog, the off-button area, etc. Otherwise a preview
-            // starts when the song is picked and never stops (because the
-            // game can dismiss the confirmation via paths we don't watch
-            // for), leaving music playing for one song while the picker
-            // shows a different one.
-            crate::frameworks::media_player::music_library::stop_song_preview();
-            // touch_up_xy is in iOS-portrait coords (320x480) because the
-            // window's frame is in UIKit's native portrait orientation.
-            // The visible confirmation panel — and the bounds below — are
-            // laid out in the rotated landscape canvas (480x320). Convert
-            // before testing.
-            // For --landscape-left (-π/2 from portrait, the only orientation
-            // this game ships in): landscape_x = portrait_y,
-            //                        landscape_y = 320 - portrait_x.
-            // Verified against the user's button-to-touch=A,240,165
-            // ("center"): landscape (240, 165) -> portrait (155, 240),
-            // matching the centre of a 320x480 canvas.
-            let landscape = touch_up_xy.map(|(px, py)| (py, 320.0 - px));
-            let tap_was_no = landscape
-                .map(|p| in_rect(p, NO_BUTTON_BOUNDS))
-                .unwrap_or(false);
-            let tap_was_create = landscape
-                .map(|p| in_rect(p, CREATE_TROOPER_BOUNDS))
-                .unwrap_or(false);
-            let tap_was_back = landscape
-                .map(|p| in_rect(p, BACK_BUTTON_BOUNDS))
-                .unwrap_or(false);
-            if tap_was_back {
-                // Back-icon: tell game to cancel its iPod flow, then tear
-                // our picker down entirely. The game's cancel handler
-                // exits the iPod view and returns to Soul Master.
-                use crate::abi::{CallFromHost, GuestFunction};
-                let cancel_fn =
-                    GuestFunction::from_addr_and_thumb_flag(0x3244, true);
-                let _: () = cancel_fn.call_from_host(env, (1i32,));
-                crate::frameworks::uikit::ui_view::ui_table_view::dismiss_promoted_picker(env);
-                log!(
-                    "ui_touch: tap at {:?} on Back -> cancel + dismiss",
-                    touch_up_xy
-                );
-            } else if tap_was_no {
-                // SIMPLE CYCLE: clear all + remount the picker.
-                //   1. Tell game to cancel its iPod flow.
-                //   2. Reset the iPodView2 animation/state singleton.
-                //   3. Aggressively re-mount our 1317-row promoted picker
-                //      (re-parent to window, flush cell cache, layout).
-                // This gives a consistent "back to picker" experience.
-                // Confirmation-panel rebuild on pick 2+ is a separate
-                // open issue documented in dev-docs/song-summoner-picker.md.
-                use crate::abi::{CallFromHost, GuestFunction};
-                let cancel_fn =
-                    GuestFunction::from_addr_and_thumb_flag(0x3244, true);
-                let _: () = cancel_fn.call_from_host(env, (1i32,));
-                crate::frameworks::uikit::ui_view::ui_table_view::invoke_ipodview_reset(env);
-                let remounted =
-                    crate::frameworks::uikit::ui_view::ui_table_view::remount_promoted_picker(env);
-                log!(
-                    "ui_touch: tap at {:?} on No -> cancel + reset + remount (remounted={})",
-                    touch_up_xy, remounted
-                );
-            } else if tap_was_create {
-                // Game advances to the next scene — remove the picker
-                // entirely (table + synthetic tab bar) so it doesn't
-                // ghost-render behind the new scene and a future picker
-                // session promotes a fresh table. Preview was already
-                // stopped above.
-                crate::frameworks::uikit::ui_view::ui_table_view::dismiss_promoted_picker(env);
-                log!(
-                    "ui_touch: tap at {:?} on Create Trooper -> picker dismissed",
-                    touch_up_xy
-                );
-            }
-            // Tap anywhere else on the confirmation screen (artwork,
-            // dialog text, off-button) -- no-op. Preview keeps playing,
-            // picker stays hidden, user can keep deciding.
-            if !tap_was_no && !tap_was_create && !tap_was_back {
-                log!(
-                    "ui_touch: confirmation-panel tap at portrait={:?} landscape={:?} (no button matched)",
-                    touch_up_xy, landscape
-                );
-            }
-        }
+        let _: () = msg![env; view touchesEnded:touches withEvent:event];
     }
 
     release(env, pool);

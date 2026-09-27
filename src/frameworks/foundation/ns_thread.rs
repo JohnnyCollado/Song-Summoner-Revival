@@ -132,8 +132,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     // return-to-host routine. The outer helper
     // (_touchHLE_NSThreadInvocationHelper) will see the call to -main
     // "return", then do its normal cleanup and let the thread coroutine end.
-    // This is what lets apps that wait on the worker thread (Song Summoner
-    // gates its calc-play-points loading screen on this) actually unblock.
+    // Without this, apps that wait for a worker thread to finish (e.g. via
+    // NSThreadWillExitNotification or isFinished) would wait forever.
     let route = env.dyld.return_to_host_routine();
     env.cpu.branch(route);
 }

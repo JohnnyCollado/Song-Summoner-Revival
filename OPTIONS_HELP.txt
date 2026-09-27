@@ -284,6 +284,19 @@ Other options:
     --allow-network-access
         Allow apps running in touchHLE to access the Internet and the local network.
 
+    --music-library
+        Give the app a music library made from a folder of your own audio
+        files (mp3, m4a, aac, wav, caf). The first time, a folder dialog asks
+        where your music is; the choice is kept in library/source.txt. The
+        folder is re-read in the background at every launch, which is quick
+        because only new or changed files are read again.
+        Desktop only: on Android the music folder is chosen in the app's
+        setup screen instead.
+
+    --choose-music-folder
+        Like --music-library, but asks for the music folder again even if one
+        was chosen before.
+
     --ignore-gl-errors
         Ignore host OpenGL errors as queried by glGetError function.
         This only affects return value of glGetError as seen by the guest

@@ -23,6 +23,7 @@ use crate::objc::messages::ThreadInitializer;
 use crate::MutexId;
 use std::collections::HashMap;
 
+mod app_overrides;
 mod classes;
 mod messages;
 mod methods;
@@ -31,6 +32,7 @@ mod properties;
 mod selectors;
 mod synchronization;
 
+pub use app_overrides::Override;
 pub use classes::{objc_classes, Class, ClassExports, ClassTemplate};
 pub use messages::{
     autorelease, msg, msg_class, msg_send, msg_send_no_type_checking, msg_send_super2, msg_super,

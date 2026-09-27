@@ -11,6 +11,9 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.content.pm.ShortcutInfo
+import android.content.pm.ShortcutManager
+import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -41,10 +44,14 @@ import java.io.IOException
 //   2. Game IPA (wrapper flavor only): if the IPA isn't in the user-data
 //      folder yet, ask the user to pick their copy with the SAF file
 //      picker and copy it there under the name MainActivity expects.
-//   3. Music folder: if no valid folder is saved, open the SAF folder
-//      picker and write the chosen path to touchHLE_music_library.txt,
-//      which music_library.rs honours.
-//   4. Start MainActivity and finish.
+//   3. Music folder: if none was chosen yet (or the "Change music folder"
+//      shortcut was used), open the SAF folder picker, keep a persistable
+//      read permission for the tree and write its URI to
+//      library/source.txt.
+//   4. Music library: read the folder into library/index.tsv
+//      (LibraryScanner), with a progress dialog. Later launches only re-read
+//      files that changed.
+//   5. Start MainActivity and finish.
 class SetupActivity : Activity() {
 
     companion object {
@@ -59,15 +66,14 @@ class SetupActivity : Activity() {
         private const val REQ_PICK_MUSIC_FOLDER = 2002
         private const val REQ_PICK_IPA = 2003
 
-        // Audio-file extensions counted by the fallback scanner. Must stay
-        // in sync with music_library.rs::SUPPORTED_EXTENSIONS.
-        private val AUDIO_EXTS = arrayOf(
-            ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".oga",
-            ".caf", ".aif", ".aiff",
-        )
+        // Set by the "Change music folder" launcher shortcut: ask for the
+        // folder again even though one is saved.
+        const val EXTRA_CHOOSE_MUSIC_FOLDER =
+            "org.touchhle.android.CHOOSE_MUSIC_FOLDER"
+        private const val SHORTCUT_MUSIC_FOLDER = "music-folder"
 
         // Public user-data folder for this flavor. Shared with MainActivity
-        // so both agree on where the IPA, options and music-library file
+        // so both agree on where the IPA, options and music library
         // live.
         internal fun resolveUserDataDir(): String {
             if (BuildConfig.WRAPPER_AUTO_LAUNCH &&
@@ -80,66 +86,14 @@ class SetupActivity : Activity() {
         private fun needsRuntimeStoragePermission(): Boolean =
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
                 Build.VERSION.SDK_INT < Build.VERSION_CODES.R
-
-        // Recursive count of audio files under dir, capped in depth and
-        // total count like the Rust-side count_audio_files_recursive.
-        private fun countAudioFilesRecursive(dir: File, depth: Int): Int {
-            val maxCount = 5000
-            val maxDepth = 4
-            if (depth > maxDepth) return 0
-            val entries = dir.listFiles() ?: return 0
-            var n = 0
-            for (f in entries) {
-                val name = f.name
-                if (name.startsWith(".")) continue
-                if (f.isDirectory) {
-                    n += countAudioFilesRecursive(f, depth + 1)
-                    if (n >= maxCount) return n
-                    continue
-                }
-                val lower = name.lowercase()
-                if (AUDIO_EXTS.any { lower.endsWith(it) }) {
-                    n++
-                }
-                if (n >= maxCount) return n
-            }
-            return n
-        }
-
-        // Convert a SAF tree URI from the external-storage DocumentsProvider
-        // into the corresponding /storage filesystem path. Other providers
-        // (Downloads, Drive, etc.) don't map to a real path and return null.
-        private fun resolveTreeUriToFilesystemPath(uri: Uri): String? {
-            if (uri.authority != "com.android.externalstorage.documents") {
-                return null
-            }
-            val docId = try {
-                DocumentsContract.getTreeDocumentId(uri)
-            } catch (e: Exception) {
-                return null
-            }
-            // docId is like "primary:Music/Sub" for internal storage or
-            // "1234-5678:Music" for an SD card.
-            val volume = docId.substringBefore(':')
-            val rel = docId.substringAfter(':', "")
-            // getExternalStorageDirectory is deprecated in favour of scoped
-            // storage, but we hold All-files access and need the real
-            // /storage path for music_library.rs, and its replacement
-            // (StorageVolume.getDirectory) only exists on API 30+.
-            @Suppress("DEPRECATION")
-            val volumePath = if (volume.equals("primary", ignoreCase = true)) {
-                Environment.getExternalStorageDirectory().absolutePath
-            } else {
-                "/storage/$volume"
-            }
-            return if (rel.isEmpty()) volumePath else "$volumePath/$rel"
-        }
     }
 
     private class NotAnIpaException : IOException()
 
     private val userDataDir = resolveUserDataDir()
-    private val musicLibraryFile = "$userDataDir/touchHLE_music_library.txt"
+    // Shared with the engine: see src/media.rs.
+    private val libraryDir = File(userDataDir, "library")
+    private val musicSourceFile = File(libraryDir, "source.txt")
 
     // True while we're away in the All-files-access Settings page, so
     // onResume knows to re-check and continue.
@@ -148,9 +102,14 @@ class SetupActivity : Activity() {
     // request or picker is already outstanding.
     private var busy = false
     private var finished = false
+    // The music folder picker was already shown (or skipped) this time.
+    private var musicFolderAsked = false
+    // The library scan already ran this time.
+    private var libraryScanned = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        publishShortcuts()
         advance()
     }
 
@@ -187,17 +146,26 @@ class SetupActivity : Activity() {
             return
         }
 
-        // Step 3: music folder. Without storage access the resolved path
-        // wouldn't be readable anyway, so skip straight to launch.
-        if (hasStorageAccess() && !isSavedMusicLibraryPathValid()) {
-            busy = true
-            // The candidate scan can walk thousands of files; keep it off
-            // the UI thread.
-            Thread({
-                val fallback = pickBestCandidateMusicFolder()
-                runOnUiThread { openMusicFolderPicker(fallback) }
-            }, "touchHLE-music-scan").start()
-            return
+        // Steps 3 and 4 keep their files in the user-data folder, so they
+        // need storage access; without it the game runs with no music.
+        if (hasStorageAccess()) {
+            // Step 3: music folder.
+            val forced = intent.getBooleanExtra(EXTRA_CHOOSE_MUSIC_FOLDER, false)
+            if (!musicFolderAsked && (forced || savedMusicTree() == null)) {
+                musicFolderAsked = true
+                busy = true
+                openMusicFolderPicker()
+                return
+            }
+
+            // Step 4: music library.
+            val tree = savedMusicTree()
+            if (!libraryScanned && tree != null) {
+                libraryScanned = true
+                busy = true
+                scanLibrary(tree)
+                return
+            }
         }
 
         launchGame()
@@ -507,34 +475,40 @@ class SetupActivity : Activity() {
     // Step 3: music folder
     // ---------------------------------------------------------------------
 
-    // Returns true iff musicLibraryFile exists and its first line names a
-    // directory that currently exists.
-    private fun isSavedMusicLibraryPathValid(): Boolean {
-        val libFile = File(musicLibraryFile)
-        if (!libFile.isFile) {
-            return false
-        }
-        return try {
-            val first = libFile.bufferedReader().use { it.readLine() }
-                ?: return false
-            val trimmed = first.trim()
-            trimmed.isNotEmpty() && File(trimmed).isDirectory
+    // The saved music folder (library/source.txt), if we still hold a read
+    // permission for it. Permissions can be revoked, or lost when the app
+    // is reinstalled, in which case the user is asked again.
+    private fun savedMusicTree(): Uri? {
+        val text = try {
+            if (musicSourceFile.isFile) musicSourceFile.readText().trim() else ""
         } catch (e: Exception) {
-            Log.w(TAG, "Couldn't read $musicLibraryFile: $e")
-            false
+            Log.w(TAG, "Couldn't read $musicSourceFile: $e")
+            ""
         }
+        if (text.isEmpty()) {
+            return null
+        }
+        val uri = Uri.parse(text)
+        val granted = contentResolver.persistedUriPermissions.any {
+            it.uri == uri && it.isReadPermission
+        }
+        if (!granted) {
+            Log.i(TAG, "No longer allowed to read the music folder $uri.")
+            return null
+        }
+        return uri
     }
 
-    private fun openMusicFolderPicker(fallback: String) {
+    private fun openMusicFolderPicker() {
         if (finished) {
             return
         }
-        // Save the best auto-detected folder first, so cancelling the
-        // picker (or the process dying) still leaves a working library
-        // and we don't re-prompt next launch.
-        writeMusicLibraryFile(fallback)
         try {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)
+            intent.addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val musicHint = Uri.parse(
                     "content://com.android.externalstorage.documents" +
@@ -542,13 +516,28 @@ class SetupActivity : Activity() {
                 )
                 intent.putExtra(DocumentsContract.EXTRA_INITIAL_URI, musicHint)
             }
-            Log.i(TAG, "No valid music folder set yet -- opening SAF " +
-                "folder picker.")
+            Log.i(TAG, "Asking for the music folder.")
             startActivityForResult(intent, REQ_PICK_MUSIC_FOLDER)
         } catch (e: Exception) {
             Log.w(TAG, "Couldn't launch ACTION_OPEN_DOCUMENT_TREE: $e")
-            launchGame()
+            busy = false
+            advance()
         }
+    }
+
+    private fun onMusicFolderPicked(tree: Uri) {
+        try {
+            contentResolver.takePersistableUriPermission(
+                tree, Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+            libraryDir.mkdirs()
+            musicSourceFile.writeText(tree.toString(), Charsets.UTF_8)
+            Log.i(TAG, "Music folder: $tree")
+        } catch (e: Exception) {
+            Log.e(TAG, "Couldn't keep access to the music folder: $e")
+        }
+        // A different folder means a different library: read it again.
+        libraryScanned = false
     }
 
     override fun onActivityResult(
@@ -558,87 +547,115 @@ class SetupActivity : Activity() {
     ) {
         super.onActivityResult(requestCode, resultCode, data)
         val picked = if (resultCode == RESULT_OK) data?.data else null
-        if (requestCode == REQ_PICK_IPA) {
-            if (picked != null) {
-                onIpaPicked(picked)
-            } else {
-                Log.i(TAG, "IPA picker cancelled.")
-                showIpaDialog()
+        when (requestCode) {
+            REQ_PICK_IPA -> {
+                if (picked != null) {
+                    onIpaPicked(picked)
+                } else {
+                    Log.i(TAG, "IPA picker cancelled.")
+                    showIpaDialog()
+                }
             }
-            return
-        }
-        if (requestCode != REQ_PICK_MUSIC_FOLDER) {
-            return
-        }
-        if (picked != null) {
-            val resolved = resolveTreeUriToFilesystemPath(picked)
-            if (resolved != null) {
-                Log.i(TAG, "Music folder picked: $resolved")
-                writeMusicLibraryFile(resolved)
-            } else {
-                Log.w(TAG, "Couldn't resolve picked folder URI $picked " +
-                    "(probably a cloud or Downloads provider, which " +
-                    "doesn't map to a real /storage path). Keeping the " +
-                    "auto-detected folder.")
+            REQ_PICK_MUSIC_FOLDER -> {
+                if (picked != null) {
+                    onMusicFolderPicked(picked)
+                } else {
+                    // Keep whatever folder was saved before (if any). With
+                    // none, the game runs without music and hides its iPod
+                    // option.
+                    Log.i(TAG, "Music folder picker cancelled.")
+                }
+                busy = false
+                advance()
             }
-        } else {
-            Log.i(TAG, "Music folder picker cancelled; keeping the " +
-                "auto-detected folder.")
-        }
-        launchGame()
-    }
-
-    // Choose the music folder to pre-seed before opening SAF: the
-    // well-known location with the most audio files, or (if none have
-    // any) a freshly created <userDataDir>/Music.
-    //
-    // Mirrors the Rust-side candidate set in
-    // music_library.rs::prompt_for_folder so both sides agree.
-    private fun pickBestCandidateMusicFolder(): String {
-        val candidates = arrayOf(
-            "/sdcard/Music",
-            "$userDataDir/Music",
-            "/sdcard/Download",
-        )
-        var best: String? = null
-        var bestCount = 0
-        for (raw in candidates) {
-            val dir = File(raw)
-            if (!dir.isDirectory) {
-                continue
-            }
-            val n = countAudioFilesRecursive(dir, 0)
-            Log.i(TAG, "fallback scan: $raw -> $n audio file(s).")
-            // Strictly greater so earlier candidates win ties -- matches
-            // Rust.
-            if (n > bestCount) {
-                best = raw
-                bestCount = n
-            }
-        }
-        if (best != null) {
-            return best
-        }
-        val seed = File("$userDataDir/Music")
-        seed.mkdirs()
-        return seed.absolutePath
-    }
-
-    // Best-effort write of an absolute path into musicLibraryFile.
-    private fun writeMusicLibraryFile(absolutePath: String) {
-        try {
-            val file = File(musicLibraryFile)
-            file.parentFile?.let { if (!it.isDirectory) it.mkdirs() }
-            file.writeText(absolutePath, Charsets.UTF_8)
-            Log.i(TAG, "Wrote music folder to $musicLibraryFile: " +
-                absolutePath)
-        } catch (e: Exception) {
-            Log.e(TAG, "Couldn't persist music folder choice: $e")
         }
     }
 
     // ---------------------------------------------------------------------
-    // Step 4: hand off to touchHLE
+    // Step 4: music library
+    // ---------------------------------------------------------------------
+
+    private fun scanLibrary(tree: Uri) {
+        val bar = ProgressBar(
+            this, null, android.R.attr.progressBarStyleHorizontal
+        )
+        bar.isIndeterminate = true
+        val label = TextView(this)
+        label.text = "Looking for songs…"
+        val layout = LinearLayout(this)
+        layout.orientation = LinearLayout.VERTICAL
+        val pad = (24 * resources.displayMetrics.density).toInt()
+        layout.setPadding(pad, pad, pad, pad)
+        layout.addView(label)
+        layout.addView(bar)
+        val progress = AlertDialog.Builder(this)
+            .setTitle("Music library")
+            .setView(layout)
+            .setCancelable(false)
+            .show()
+
+        Thread({
+            var lastUpdate = 0L
+            val count = try {
+                LibraryScanner(this, libraryDir).scan(tree) { done, total ->
+                    val now = System.currentTimeMillis()
+                    if (total >= 0 && (done == total || now - lastUpdate >= 100)) {
+                        lastUpdate = now
+                        runOnUiThread {
+                            bar.isIndeterminate = false
+                            bar.max = maxOf(total, 1)
+                            bar.progress = done
+                            label.text = "Reading your music library… " +
+                                "%,d / %,d".format(done, total)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // Most likely the folder was removed. Keep the old index.
+                Log.e(TAG, "media: music scan failed: $e")
+                -1
+            }
+            runOnUiThread {
+                progress.dismiss()
+                Log.i(TAG, "media: library has $count songs")
+                busy = false
+                advance()
+            }
+        }, "touchHLE-music-scan").start()
+    }
+
+    // Long-pressing the launcher icon offers "Change music folder", which
+    // opens this screen with EXTRA_CHOOSE_MUSIC_FOLDER. It's a dynamic
+    // shortcut because a static one (res/xml/shortcuts.xml) has to spell out
+    // the package id, which differs per flavor.
+    private fun publishShortcuts() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N_MR1) {
+            return
+        }
+        try {
+            val manager = getSystemService(ShortcutManager::class.java)
+                ?: return
+            val intent = Intent(this, SetupActivity::class.java)
+                .setAction(Intent.ACTION_VIEW)
+                .putExtra(EXTRA_CHOOSE_MUSIC_FOLDER, true)
+                .addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_CLEAR_TASK
+                )
+            val shortcut = ShortcutInfo.Builder(this, SHORTCUT_MUSIC_FOLDER)
+                .setShortLabel("Change music folder")
+                .setLongLabel("Change music folder")
+                .setIcon(Icon.createWithResource(this, BuildConfig.APP_ICON))
+                .setIntent(intent)
+                .build()
+            manager.dynamicShortcuts = listOf(shortcut)
+        } catch (e: Exception) {
+            Log.w(TAG, "Couldn't publish launcher shortcuts: $e")
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Step 5: hand off to touchHLE
     // ---------------------------------------------------------------------
 
     // The user declined a setup step. The generic flavor can still run
