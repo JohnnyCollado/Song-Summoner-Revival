@@ -12,7 +12,7 @@
 //! window system interaction in general, because it is assumed only one window
 //! will be needed for the runtime of the app.
 
-use crate::gles::present::present_frame;
+use crate::gles::present::{present_frame, FocusMarker};
 use crate::gles::{create_gles1_ctx_no_parent_stack, GLESContext, GLES};
 use crate::image::Image;
 use crate::matrix::Matrix;
@@ -185,6 +185,24 @@ pub enum PadButton {
     RightShoulder,
     Start,
     Back,
+    /// L2 / R2. SDL reports them as axes; [trigger_edge] turns them into
+    /// presses.
+    LeftTrigger,
+    RightTrigger,
+}
+
+/// A trigger's axis (0 to 1) as a button: `Some(true)` when it goes past
+/// half-way, `Some(false)` when it comes back below a quarter, `None`
+/// otherwise. The gap between the two keeps a half-pulled trigger from
+/// chattering.
+pub fn trigger_edge(was_down: bool, value: f32) -> Option<bool> {
+    if !was_down && value > 0.5 {
+        Some(true)
+    } else if was_down && value < 0.25 {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -294,14 +312,19 @@ pub struct Window {
     controllers: Vec<sdl2::controller::GameController>,
     dpad_state: DpadState,
     stick_active: bool,
+    /// Whether L2 and R2 are pulled, as buttons (see [trigger_edge]).
+    triggers_down: [bool; 2],
     _sensor_ctx: sdl2::SensorSubsystem,
     accelerometer: Option<sdl2::sensor::Sensor>,
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
     /// A rectangle (x, y, width, height, in the app's portrait screen
-    /// points) to outline over the app: the controller's focus in menus
-    /// that have none of their own (see [Self::set_focus_marker]).
-    focus_marker: Option<(f32, f32, f32, f32)>,
+    /// points) to outline over the app, and how: the controller's focus in
+    /// menus that have none of their own (see [Self::set_focus_marker]).
+    focus_marker: Option<FocusMarker>,
+    /// Lines (from, to, in the app's portrait screen points) to draw over
+    /// the app, for debugging (see [Self::set_debug_lines]).
+    debug_lines: Vec<((f32, f32), (f32, f32))>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
     /// Whether or not we are on the "main" environment stack (rather than
     /// a coroutine stack). Checked in various functions to make sure that
@@ -461,11 +484,13 @@ impl Window {
                 active: false,
             },
             stick_active: false,
+            triggers_down: [false; 2],
             _sensor_ctx: sensor_ctx,
             accelerometer,
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
             focus_marker: None,
+            debug_lines: Vec::new(),
             virtual_accelerometer_last: None,
             on_main_stack: true,
         };
@@ -643,6 +668,30 @@ impl Window {
                         self.event_queue.push_back(Event::ControllerButton {
                             button,
                             pressed: matches!(event, E::ControllerButtonDown { .. }),
+                            controller_type: controller_type(which),
+                        });
+                    }
+                }
+                // The triggers are axes; touchHLE's menus want them as
+                // buttons.
+                E::ControllerAxisMotion {
+                    which, axis, value, ..
+                } if matches!(
+                    axis,
+                    sdl2::controller::Axis::TriggerLeft | sdl2::controller::Axis::TriggerRight
+                ) =>
+                {
+                    let (i, button) = if axis == sdl2::controller::Axis::TriggerLeft {
+                        (0, PadButton::LeftTrigger)
+                    } else {
+                        (1, PadButton::RightTrigger)
+                    };
+                    let value = f32::from(value) / f32::from(i16::MAX);
+                    if let Some(pressed) = trigger_edge(self.triggers_down[i], value) {
+                        self.triggers_down[i] = pressed;
+                        self.event_queue.push_back(Event::ControllerButton {
+                            button,
+                            pressed,
                             controller_type: controller_type(which),
                         });
                     }
@@ -1138,17 +1187,19 @@ impl Window {
     }
 
     /// Outline a rectangle of the app's screen (x, y, width, height, in
-    /// portrait screen points, as `-[UIView convertRect:toView:nil]` gives),
-    /// or stop. It stays until changed.
-    pub fn set_focus_marker(&mut self, rect: Option<(f32, f32, f32, f32)>) {
-        self.focus_marker = rect;
+    /// portrait screen points, as `-[UIView convertRect:toView:nil]` gives)
+    /// in the given shape, or stop. It stays until changed.
+    pub fn set_focus_marker(&mut self, marker: Option<FocusMarker>) {
+        self.focus_marker = marker;
     }
 
     /// For use when redrawing the screen: where the focus marker is in the
     /// window (x, y, width, height, in the same pixels as
-    /// [Self::virtual_cursor_visible_at]), if there is one.
-    pub fn focus_marker_visible_at(&self) -> Option<(f32, f32, f32, f32)> {
-        let (x, y, w, h) = self.focus_marker?;
+    /// [Self::virtual_cursor_visible_at]) and its shape, if there is one.
+    /// A diamond inscribed in the rectangle stays inscribed in it through
+    /// the quarter-turn rotations.
+    pub fn focus_marker_visible_at(&self) -> Option<FocusMarker> {
+        let ((x, y, w, h), shape) = self.focus_marker?;
         let to_window = |p| {
             screen_to_viewport(
                 p,
@@ -1160,7 +1211,33 @@ impl Window {
         // Rotations are by quarter turns, so opposite corners are enough.
         let (x0, y0) = to_window((x, y));
         let (x1, y1) = to_window((x + w, y + h));
-        Some((x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs()))
+        Some((
+            (x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs()),
+            shape,
+        ))
+    }
+
+    /// Draw lines over the app (from, to, in portrait screen points, like
+    /// [Self::set_focus_marker]), for debugging. They stay until changed;
+    /// an empty list stops.
+    pub fn set_debug_lines(&mut self, lines: Vec<((f32, f32), (f32, f32))>) {
+        self.debug_lines = lines;
+    }
+
+    /// For use when redrawing the screen: the debug lines in the window, in
+    /// the same pixels as [Self::focus_marker_visible_at].
+    pub fn debug_lines_visible_at(&self) -> Vec<((f32, f32), (f32, f32))> {
+        if self.debug_lines.is_empty() {
+            return Vec::new();
+        }
+        let viewport = self.viewport();
+        let rotation = self.rotation_matrix();
+        let size = self.size_unrotated_unscaled();
+        let to_window = |p| screen_to_viewport(p, viewport, &rotation, size);
+        self.debug_lines
+            .iter()
+            .map(|&(from, to)| (to_window(from), to_window(to)))
+            .collect()
     }
 
     /// For use when redrawing the screen: Get the cached on-screen position and
@@ -1418,6 +1495,7 @@ impl Window {
                 matrix,
                 /* virtual_cursor_visible_at: */ None,
                 /* focus_marker: */ None,
+                /* debug_lines: */ &[],
             );
 
             gl_ctx.DeleteTextures(1, &texture);
@@ -1746,5 +1824,19 @@ mod tests {
         let rotation = Matrix::z_rotation(-FRAC_PI_2);
         let (x, y) = screen_to_viewport((160.0, 240.0), viewport, &rotation, SCREEN);
         assert!((x - 520.0).abs() < 0.01 && (y - 330.0).abs() < 0.01, "{x} {y}");
+    }
+
+    #[test]
+    fn triggers_press_past_half_and_release_below_a_quarter() {
+        // Pulled past half-way: pressed.
+        assert_eq!(trigger_edge(false, 0.3), None);
+        assert_eq!(trigger_edge(false, 0.51), Some(true));
+        // Held part-way doesn't chatter: it stays down until under 25%.
+        assert_eq!(trigger_edge(true, 0.4), None);
+        assert_eq!(trigger_edge(true, 0.26), None);
+        assert_eq!(trigger_edge(true, 0.2), Some(false));
+        // Already up or down: nothing new.
+        assert_eq!(trigger_edge(false, 0.0), None);
+        assert_eq!(trigger_edge(true, 1.0), None);
     }
 }

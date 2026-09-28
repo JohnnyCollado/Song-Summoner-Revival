@@ -553,6 +553,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     let rotation_matrix = env.window.as_mut().unwrap().rotation_matrix();
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
     let focus_marker = env.window.as_mut().unwrap().focus_marker_visible_at();
+    let debug_lines = env.window.as_mut().unwrap().debug_lines_visible_at();
 
     let gles_ctx = super::get_thread_context(
         &mut env.framework_state.opengles,
@@ -686,6 +687,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         rotation_matrix,
         virtual_cursor_visible_at,
         focus_marker,
+        &debug_lines,
     );
 
     // Clean up the texture

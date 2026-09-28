@@ -142,6 +142,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         env.window().rotation_matrix(),
         env.window().virtual_cursor_visible_at(),
         env.window().focus_marker_visible_at(),
+        env.window().debug_lines_visible_at(),
     );
 
     // TODO: draw status bar if it's not hidden
@@ -369,6 +370,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             present_frame_args.1,
             present_frame_args.2,
             present_frame_args.3,
+            &present_frame_args.4,
         );
     }
     std::mem::drop(gles);

@@ -1121,7 +1121,12 @@ fn pad_action(list: &mut ListView, role: Role, waking: bool) -> Action {
                 Action::Cancel
             };
         }
-        Role::PrevTab | Role::NextTab | Role::Info => {}
+        Role::PrevTab
+        | Role::NextTab
+        | Role::Info
+        | Role::Skip
+        | Role::ZoomOut
+        | Role::ZoomIn => {}
     }
     Action::None
 }
@@ -1147,7 +1152,10 @@ pub(super) fn handle_pad_button(
         return false;
     };
     // Buttons the picker has no use for still don't reach the game.
-    let Some(role) = pad::role(button, env.options.confirm_button) else {
+    // The triggers only zoom battle's map.
+    let Some(role) = pad::role(button, env.options.confirm_button)
+        .filter(|role| !matches!(role, Role::ZoomOut | Role::ZoomIn))
+    else {
         return true;
     };
     let picker = env

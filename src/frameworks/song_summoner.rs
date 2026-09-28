@@ -16,6 +16,7 @@
 //! See dev-docs/song-summoner-media-plan.md (design) and
 //! dev-docs/song-summoner-re.md (the game's side of the contract).
 
+mod battle;
 mod game_input;
 mod glyphs;
 mod pad;

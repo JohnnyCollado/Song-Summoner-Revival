@@ -30,6 +30,12 @@ pub enum Role {
     /// The north face button: a screen's extra panel, like the card
     /// list's status panel. The picker has none.
     Info,
+    /// Start: the game's SKIP button, in cutscenes that allow it.
+    Skip,
+    /// The triggers (L2 / R2): zoom battle's map out and in. The picker has
+    /// no use for them.
+    ZoomOut,
+    ZoomIn,
 }
 
 pub fn role(button: PadButton, confirm: ConfirmButton) -> Option<Role> {
@@ -44,6 +50,9 @@ pub fn role(button: PadButton, confirm: ConfirmButton) -> Option<Role> {
         PadButton::LeftShoulder => Role::PrevTab,
         PadButton::RightShoulder => Role::NextTab,
         PadButton::FaceNorth => Role::Info,
+        PadButton::Start => Role::Skip,
+        PadButton::LeftTrigger => Role::ZoomOut,
+        PadButton::RightTrigger => Role::ZoomIn,
         _ => return None,
     })
 }
@@ -125,9 +134,15 @@ mod tests {
 
     #[test]
     fn other_buttons_do_nothing() {
-        for button in [PadButton::FaceWest, PadButton::Start, PadButton::Back] {
+        for button in [PadButton::FaceWest, PadButton::Back] {
             assert_eq!(role(button, ConfirmButton::South), None, "{button:?}");
         }
+    }
+
+    #[test]
+    fn start_skips_cutscenes() {
+        assert_eq!(role(PadButton::Start, ConfirmButton::South), Some(Role::Skip));
+        assert!(!repeats(Role::Skip));
     }
 
     #[test]
@@ -135,6 +150,17 @@ mod tests {
         assert_eq!(role(PadButton::FaceNorth, ConfirmButton::South), Some(Role::Info));
         assert_eq!(role(PadButton::FaceNorth, ConfirmButton::East), Some(Role::Info));
         assert!(!repeats(Role::Info));
+    }
+
+    #[test]
+    fn triggers_zoom_and_dont_repeat() {
+        // L2 zooms battle's map out, R2 in; a held trigger is one step.
+        for c in [ConfirmButton::South, ConfirmButton::East] {
+            assert_eq!(role(PadButton::LeftTrigger, c), Some(Role::ZoomOut));
+            assert_eq!(role(PadButton::RightTrigger, c), Some(Role::ZoomIn));
+        }
+        assert!(!repeats(Role::ZoomOut));
+        assert!(!repeats(Role::ZoomIn));
     }
 
     #[test]
