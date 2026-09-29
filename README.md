@@ -49,7 +49,7 @@ folder, long-press the app icon and choose **Change music folder** (close
 the game first).
 
 Everything the scan produces lives in `library/` inside the game's data
-folder (next to `touchHLE.exe`, or the app's own folder on Android):
+folder (next to `S.S.Encore.exe`, or the app's own folder on Android):
 `index.tsv`, `art/`, `playcounts.tsv` and `source.txt` (one music folder
 per line).
 
@@ -80,7 +80,7 @@ Changing the game file or music folders restarts the game after asking
 `song_summoner_settings.txt` in the data folder.
 
 **Where your saves are.** On Windows, everything lives next to
-`touchHLE.exe`. On Android the game runs from its own folder (shown as
+`S.S.Encore.exe`. On Android the game runs from its own folder (shown as
 "Song Summoner" in the Files app) and keeps a copy in your save folder, with
 the same layout; Setup > Data & help > Open data folder shows it. Saves are in
 `touchHLE_sandbox/com.square-enix.SongSummonerEncore/` (`Documents/` and
@@ -120,7 +120,7 @@ counts towards the game's listening points.
 
 ## Heads-up: antivirus false positives on Windows
 
-`touchHLE.exe` is unsigned and ships a JIT (dynarmic) that allocates
+`S.S.Encore.exe` is unsigned and ships a JIT (dynarmic) that allocates
 executable memory at runtime to translate ARM code — a pattern that
 trips heuristic scanners. **Avast, AVG, Bitdefender, occasionally
 Windows Defender, and SmartScreen** may flag it or move it to

@@ -461,6 +461,19 @@ region 6.
   way after 47 frames. Drags of 2.7-3.8 points land one row on; the
   controller uses 3.5 (10 frames). Touch hits the same crawl when a flick
   stops near half a row.
+- **The snap only runs with the cursor (`+2`) at -1.** Edit Troopers'
+  item list has a cursor (0), and there `menumain` just glides at x 0.9
+  forever (log 2026-09-29: a 3.5 drag from row 0 came to rest at
+  1.4583, half between rows, its speed 1e-10 and never 0). A glide
+  covers 10x its first frame's dy / 24 rows, so the controller drags
+  2.4 points a row, aimed at a whole row from wherever the list is, and
+  counts a list as still below 0.012 rows a frame (`list_still`; about
+  5 points left to coast, ~20 frames a row). Snapping lists still wait
+  for exactly 0.
+- The controller only scrolls a list toward its focus after a command
+  moved it (`list_keep_focus`). A list scrolled by touch takes the focus
+  along onto its rows instead; dragging it back to the focus fought the
+  finger (2026-09-29 log).
 - `SysMenu_Check` (the shop's older list) computes the same speed,
   (prev.y - y) / 24, but a finger down on an enabled row makes it the
   cursor and calls `SysTouch_Clear`. Its caller runs `menumain` itself

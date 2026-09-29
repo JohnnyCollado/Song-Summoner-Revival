@@ -58,7 +58,7 @@ com.ea.spore.row.efigsj: --landscape-left --y-tilt-offset=35
 com.namconetworks.katamari: --landscape-left --stabilize-virtual-cursor=0.1,10 --y-tilt-offset=24 --button-to-touch=Start,240,15
 
 # Song Summoner: The Unsung Heroes Encore
-com.square-enix.SongSummonerEncore: --landscape-left --disable-analog-stick-tilt-controls --disable-virtual-cursor --music-library
+com.square-enix.SongSummonerEncore: --landscape-left --disable-analog-stick-tilt-controls --disable-virtual-cursor --music-library --maximized
 
 # Wolfenstein RPG
 com.eamobile.wolfbv: --landscape-left --stabilize-virtual-cursor=0.1,10 --button-to-touch=A,240,160 --button-to-touch=B,240,280 --button-to-touch=X,26,280 --button-to-touch=Y,454,280 --button-to-touch=DPadLeft,34,178 --button-to-touch=DPadUp,76,140 --button-to-touch=DPadRight,116,180 --button-to-touch=DPadDown,76,220

@@ -24,6 +24,11 @@ use std::process::{Command, ExitCode};
 /// starting the game.
 const SHIPPED_FILES: &[&str] = &["touchHLE_default_options.txt", "CREDITS.txt"];
 
+/// The shipped executable's name, without `.exe`. Only the name changes:
+/// the restart after picking a new game file uses `current_exe`, and the
+/// game's data folder is the working folder, not named after the exe.
+const EXE_NAME: &str = "S.S.Encore";
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -73,11 +78,11 @@ fn build_windows(release: bool) -> Result<(), String> {
     };
     let exe_suffix = std::env::consts::EXE_SUFFIX;
     // The bin target is touchHLE_bin (see the root Cargo.toml for why);
-    // users get it under the familiar touchHLE.exe name.
+    // players get it under the game's name.
     let exe = target_dir
         .join(profile)
         .join(format!("touchHLE_bin{exe_suffix}"));
-    let exe_name = format!("touchHLE{exe_suffix}");
+    let exe_name = format!("{EXE_NAME}{exe_suffix}");
 
     let out = root
         .join(if release { "dist" } else { "debug" })
@@ -88,6 +93,12 @@ fn build_windows(release: bool) -> Result<(), String> {
     std::fs::create_dir_all(&out).map_err(|e| io_err("create", &out, e))?;
 
     copy_file(&exe, &out.join(&exe_name))?;
+    // Builds before the rename shipped touchHLE.exe; don't leave a stale
+    // copy beside the new one.
+    let old_exe = out.join(format!("touchHLE{exe_suffix}"));
+    if old_exe.exists() {
+        std::fs::remove_file(&old_exe).map_err(|e| io_err("remove", &old_exe, e))?;
+    }
     copy_dir(&root.join("touchHLE_dylibs"), &out.join("touchHLE_dylibs"))?;
     copy_dir(&root.join("touchHLE_fonts"), &out.join("touchHLE_fonts"))?;
     for name in SHIPPED_FILES {

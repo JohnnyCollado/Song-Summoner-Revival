@@ -532,14 +532,14 @@ impl Window {
         } else {
             let (width, height) =
                 size_for_orientation(device_family, device_orientation, scale_hack);
-            let window = video_ctx
-                .window(title, width, height)
-                .position_centered()
-                .resizable()
-                .opengl()
-                .build()
-                .unwrap();
-            window
+            let mut builder = video_ctx.window(title, width, height);
+            builder.position_centered().resizable().opengl();
+            // The output is letterboxed to fit, like a hand-resized window;
+            // restoring it goes back to the usual size, centred.
+            if options.maximized {
+                builder.maximized();
+            }
+            builder.build().unwrap()
         };
 
         if env::consts::OS == "android" {
@@ -1757,7 +1757,12 @@ impl Window {
             return;
         }
 
-        if !self.fullscreen && !Self::rotatable_fullscreen() {
+        // A maximized window keeps its size (setting one would restore it);
+        // the output is letterboxed to the new orientation instead.
+        let maximized = self.window.window_flags()
+            & sdl2_sys::SDL_WindowFlags::SDL_WINDOW_MAXIMIZED as u32
+            != 0;
+        if !self.fullscreen && !Self::rotatable_fullscreen() && !maximized {
             let (width, height) = if Self::rotatable_fullscreen() {
                 set_sdl2_orientation(new_orientation);
                 rotate_fullscreen_size(new_orientation, self.window.size())

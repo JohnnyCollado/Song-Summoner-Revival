@@ -6,8 +6,8 @@ Run each one on its own.
 
 | Build | Command | Output |
 |---|---|---|
-| Windows release | `cargo dist-windows` | `dist\windows\` |
-| Windows debug | `cargo debug-windows` | `debug\windows\` |
+| Windows release | `cargo dist-windows` | `dist\windows\S.S.Encore.exe` |
+| Windows debug | `cargo debug-windows` | `debug\windows\S.S.Encore.exe` |
 | Android Song Summoner release | `.\android\gradlew.bat -p android :app:assembleSongsummonerRelease` | `dist\song-summoner-<version>.apk` |
 | Android Song Summoner debug | `.\android\gradlew.bat -p android :app:assembleSongsummonerDebug` | `debug\song-summoner-<version>.apk` |
 | Android touchHLE release | `.\android\gradlew.bat -p android :app:assembleTouchhleRelease` | `dist\touchhle-<version>.apk` |
@@ -58,11 +58,17 @@ sdk.dir=C\:\\Users\\<you>\\AppData\\Local\\Android\\Sdk
 
 ## 2. Windows
 
-The helper in `xtask/` runs `cargo build`, then puts `touchHLE.exe` together
+The helper in `xtask/` runs `cargo build`, then puts `S.S.Encore.exe` together
 with `touchHLE_dylibs\`, `touchHLE_fonts\`, `res\` and
 `touchHLE_default_options.txt` into a runnable folder. The folder is never
 wiped, so your IPA, saves (`touchHLE_sandbox\`) and `touchHLE_options.txt`
-survive a rebuild.
+survive a rebuild. The only thing it removes is a `touchHLE.exe` left by
+builds from before the rename.
+
+The exe is `S.S.Encore.exe` (the cargo binary is still `touchHLE_bin`).
+The game opens maximized, scaled to fit; that's `--maximized` on Song
+Summoner's line in `touchHLE_default_options.txt`. Restore the window for
+the usual size, or press F11 for fullscreen.
 
 ### Release → `dist\windows\`
 
@@ -157,22 +163,22 @@ own IPA from `apps\`.
 Debug:
 
 ```bash
-Start-Process -NoNewWindow -Wait -FilePath .\debug\windows\touchHLE.exe -WorkingDirectory .\debug\windows -ArgumentList "`"$PWD\apps\Song Summoner The Unsung Heroes Encore.ipa`""
+Start-Process -NoNewWindow -Wait -FilePath .\debug\windows\S.S.Encore.exe -WorkingDirectory .\debug\windows -ArgumentList "`"$PWD\apps\Song Summoner The Unsung Heroes Encore.ipa`""
 ```
 
 Release:
 
 ```bash
-Start-Process -NoNewWindow -Wait -FilePath .\dist\windows\touchHLE.exe -WorkingDirectory .\dist\windows -ArgumentList "`"$PWD\apps\Song Summoner The Unsung Heroes Encore.ipa`""
+Start-Process -NoNewWindow -Wait -FilePath .\dist\windows\S.S.Encore.exe -WorkingDirectory .\dist\windows -ArgumentList "`"$PWD\apps\Song Summoner The Unsung Heroes Encore.ipa`""
 ```
 
 Debug, with a full Rust backtrace if it crashes:
 
 ```bash
-$env:RUST_BACKTRACE=1; Start-Process -NoNewWindow -Wait -FilePath .\debug\windows\touchHLE.exe -WorkingDirectory .\debug\windows -ArgumentList "`"$PWD\apps\Song Summoner The Unsung Heroes Encore.ipa`""
+$env:RUST_BACKTRACE=1; Start-Process -NoNewWindow -Wait -FilePath .\debug\windows\S.S.Encore.exe -WorkingDirectory .\debug\windows -ArgumentList "`"$PWD\apps\Song Summoner The Unsung Heroes Encore.ipa`""
 ```
 
-Avoid `cargo run` and running `touchHLE.exe` directly from the repo root.
+Avoid `cargo run` and running `S.S.Encore.exe` directly from the repo root.
 Either one clutters the root with runtime files.
 
 ---
@@ -209,11 +215,31 @@ panic; that's the crash test's deliberate panic being caught:
 cargo test --lib scan_windows::
 ```
 
-The picker: drawing primitives, layout, and which fighter portrait each
-song gets:
+Everything Song Summoner-specific: the picker, the Setup menu, settings,
+keys and pad bindings, controller input (menus, lists, battle, world map),
+the Android save mirror, backups and credits:
 
 ```bash
 cargo test --lib song_summoner::
+```
+
+Just the controller's list scrolling (the item lists), against the
+game's scroll model:
+
+```bash
+cargo test --lib song_summoner::game_input::tests::a_list
+```
+
+Command-line options, including `--maximized`:
+
+```bash
+cargo test --lib options::
+```
+
+`cargo test` takes one filter before `--`. For several, put them after it:
+
+```bash
+cargo test --lib -- gles::present:: media::source:: scan_windows::
 ```
 
 The Android scanner's pure helpers (currently the read-thread count). JVM
@@ -302,7 +328,7 @@ Remove-Item .\debug\windows\library\index.tsv -ErrorAction SilentlyContinue
 ```
 
 ```bash
-Start-Process -NoNewWindow -Wait -FilePath .\debug\windows\touchHLE.exe -WorkingDirectory .\debug\windows -ArgumentList "`"$PWD\apps\Song Summoner The Unsung Heroes Encore.ipa`""
+Start-Process -NoNewWindow -Wait -FilePath .\debug\windows\S.S.Encore.exe -WorkingDirectory .\debug\windows -ArgumentList "`"$PWD\apps\Song Summoner The Unsung Heroes Encore.ipa`""
 ```
 
 Read the result. The log is rewritten on every launch, so check it before
@@ -409,4 +435,58 @@ cargo ndk -t arm64-v8a build --release
 
 ```bash
 .\android\gradlew.bat -p android clean
+```
+
+### New machine or moved repo
+
+- **CMake error about `cmake_minimum_required` / compatibility with
+  CMake < 3.5:** CMake 4 no longer accepts the vendored libraries' old
+  minimums. Set this once as a user environment variable, then open a new
+  terminal:
+
+```bash
+[Environment]::SetEnvironmentVariable('CMAKE_POLICY_VERSION_MINIMUM','3.5','User')
+```
+
+- **MSBuild "Could not find a part of the path ... .tlog":** the path under
+  `target\` is past Windows' 260-character limit. Keep the repo at a short
+  path (e.g. `C:\NEXTJJEN\repos\Song-Summoner-Revival`).
+- **`cargo debug-windows` says "couldn't run cargo: The directory name is
+  invalid (os error 267)":** the repo was moved with its old `target\`, and
+  the build helper still points at the old folder. Clear it and build again:
+
+```bash
+cargo clean
+```
+
+- **Gradle: "Value ... given for org.gradle.java.home ... is invalid":**
+  `android\gradle.properties` names another machine's JDK. Override it in
+  `%USERPROFILE%\.gradle\gradle.properties` (not the repo), with doubled
+  backslashes, e.g.
+  `org.gradle.java.home=C\:\\Program Files\\Microsoft\\jdk-17.0.20.8-hotspot`
+- **Gradle: "filename, directory name, or volume label syntax is
+  incorrect":** the backslashes in `android\local.properties` aren't
+  doubled; it has to read exactly like the example in section 1.
+- **Gradle: licences not accepted for `ndk;<version>`:** install the pinned
+  NDK and platform with the SDK's command-line tools (Android Studio > SDK
+  Manager > SDK Tools > Android SDK Command-line Tools). Newer versions
+  hand `sdkmanager` over to an `android` CLI whose package ids use `/`:
+
+```bash
+& "$env:LOCALAPPDATA\Android\Sdk\cmdline-tools\latest\bin\android.exe" --sdk="$env:LOCALAPPDATA\Android\Sdk" sdk install ndk/30.0.14904198 platforms/android-31
+```
+
+### Controller: reading what a list did
+
+Debug builds log every scroll the controller makes on a list, frame by
+frame. Run the game, reproduce, quit, then:
+
+```bash
+Select-String -Path .\debug\windows\touchHLE_log.txt -Pattern "input: list" | Select-Object -First 200
+```
+
+Just the decisions (drags, touch scrolls, wrong-way scrolls):
+
+```bash
+Select-String -Path .\debug\windows\touchHLE_log.txt -Pattern "moved by touch|wrong way|dragging at"
 ```

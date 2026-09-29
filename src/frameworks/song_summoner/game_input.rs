@@ -245,6 +245,16 @@ const SCENE_GROUPS: usize = SCENE_BUTTONS.len();
 /// after 47 frames (the shop, 2026-09-28 log). 2.7 to 3.8 all land one row
 /// on; 3.5 does it in 10 frames (see `tests::menumain_step`).
 const LIST_DRAG: f32 = 3.5;
+/// The same for a list with a cursor (Edit Troopers' item list,
+/// 2026-09-29 log), which never snaps: it just glides, covering 10x its
+/// first frame's dy / 24 rows, so this many points a row lands it on one.
+const LIST_COAST_DRAG: f32 = 2.4;
+/// Below this speed (rows a frame) a list that doesn't snap counts as
+/// still. It only gets near 0 (1e-10 after 200 frames), so waiting for
+/// exactly 0 stalled the controller. By here under 0.12 of a row (5
+/// points) is left, which it finishes by itself; a one-row scroll takes
+/// about 20 frames rather than the 30 it took at 0.004.
+const LIST_STILL: f32 = 0.012;
 /// A `SysMenu` row's height (`SysMenu_Check2`'s hit test).
 const LIST_ROW_H: f32 = 40.0;
 /// A point on the card list's status panel (x <= 160 in status mode).
@@ -930,6 +940,10 @@ pub struct ListMenu {
     /// Not scrolling.
     pub settled: bool,
     pub cursor: usize,
+    /// `menumain` ends a glide on a whole row, which it only does with
+    /// the cursor at -1 (the shop's lists). With a cursor (Edit
+    /// Troopers' item list) it coasts to wherever the glide runs out.
+    pub snaps: bool,
     /// The menu's x (`+0xd08`), where its highlight starts (its rows
     /// start a little further right).
     pub menu_x: Option<f32>,
@@ -1045,8 +1059,44 @@ impl ListMenu {
         let x = (self.rows[first].0 / 2.0).max(1.0);
         // Finger up moves the list on to later rows (the speed is
         // -dy / 24).
-        let dy = if i >= first { -LIST_DRAG } else { LIST_DRAG };
+        let dy = if self.snaps {
+            if i >= first {
+                -LIST_DRAG
+            } else {
+                LIST_DRAG
+            }
+        } else {
+            // The nearest whole-row view with row i in it, reached in one
+            // coast from wherever the list is, even between rows.
+            let target = if i >= first { i + 1 - self.shown.max(1) } else { i };
+            -(target as f32 - self.first) * LIST_COAST_DRAG
+        };
         Some(Gesture::Drag { x, y, dy })
+    }
+}
+
+/// A list's scroll speed is slow enough to count as still. A snapping
+/// list does stop at 0 (and passes through slow speeds when its snap
+/// turns back), so for it only 0 counts.
+pub fn list_still(speed: f32, snaps: bool) -> bool {
+    if snaps {
+        speed == 0.0
+    } else {
+        speed.abs() < LIST_STILL
+    }
+}
+
+/// What to do with a list's focus while the list is still: `follow` (a
+/// command moved it) scrolls toward it; otherwise an off-screen focus was
+/// left there by a touch scroll, so it moves onto the rows shown rather
+/// than dragging the list back (seen 2026-09-29).
+pub fn list_keep_focus(list: &ListMenu, focus: usize, follow: bool) -> (usize, Option<Gesture>) {
+    if !list.settled || list.row_visible(focus) {
+        (focus, None)
+    } else if follow {
+        (focus, list.scroll_toward(focus))
+    } else {
+        (list.clamp_to_shown(focus), None)
     }
 }
 
@@ -2183,6 +2233,10 @@ pub struct State {
     /// ([judge_scroll]); a list that didn't move gets no more drags, and
     /// the focus stays on the rows shown.
     list_scroll: Option<(u32, f32, bool)>,
+    /// A command moved a list's focus (or is waiting to tap it), so the
+    /// list scrolls to it; until then an off-screen focus was left there
+    /// by a touch scroll, and goes to the rows shown ([list_keep_focus]).
+    list_follow: bool,
     /// Menus open last frame (work addresses), to spot a new one.
     known_menus: Vec<u32>,
     /// Running tasks' main functions last frame, and the outline last
@@ -2545,14 +2599,17 @@ fn read_list(env: &Environment, prim_work: u32, work: u32) -> Option<ListMenu> {
         ));
         enabled.push(env.mem.read(ConstPtr::<u8>::from_bits(item + 0x14)) != 0);
     }
+    let cursor = read_i8(env, work + 2);
+    let snaps = cursor < 0;
     Some(ListMenu {
         work,
         rows,
         enabled,
         first: read_f32(env, work + 0xd18),
         shown: read_i8(env, work + 5).max(1) as usize,
-        settled: read_f32(env, work + 0xd1c) == 0.0,
-        cursor: (read_i8(env, work + 2).max(0) as usize).min(count as usize - 1),
+        settled: list_still(read_f32(env, work + 0xd1c), snaps),
+        cursor: (cursor.max(0) as usize).min(count as usize - 1),
+        snaps,
         menu_x: Some(f32::from(read_i16(env, work + 0xd08))),
         highlight: read_list_highlight(env, prim_work, read_u32(env, work + 0xd28)),
         back: OUTSIDE,
@@ -5122,6 +5179,9 @@ fn menu_commands(
         if state.taps.is_idle() {
             while let Some(role) = state.commands.pop_front() {
                 let (new_focus, tap) = list_command(list, focus, role);
+                if new_focus != focus || tap.is_none() {
+                    state.list_follow = true;
+                }
                 focus = if stuck {
                     list.clamp_to_shown(new_focus)
                 } else {
@@ -5140,8 +5200,8 @@ fn menu_commands(
                     }
                 }
             }
-            // Bring the focused row on screen, a row at a time. The frames
-            // after a drag let its glide register as the list's speed.
+            // Bring the focused row on screen. The frames after a drag let
+            // its glide register as the list's speed.
             if stuck {
                 let shown = list.clamp_to_shown(focus);
                 if shown != focus {
@@ -5154,7 +5214,17 @@ fn menu_commands(
                     focus = shown;
                 }
             } else if !pending && state.since_drag > HOLD_FRAMES + 2 {
-                if let Some(Gesture::Drag { x, y, dy }) = list.scroll_toward(focus) {
+                let (kept, drag) = list_keep_focus(list, focus, state.list_follow);
+                if kept != focus {
+                    log!(
+                        "input: list moved by touch (at {}), focus from row {} to {}",
+                        list.first,
+                        focus,
+                        kept
+                    );
+                    focus = kept;
+                }
+                if let Some(Gesture::Drag { x, y, dy }) = drag {
                     log!(
                         "input: list, dragging at {:?} by {} to scroll toward row {} (at {}, {} shown, cursor {})",
                         (x, y),
@@ -5171,6 +5241,9 @@ fn menu_commands(
                     state.list_scroll = Some((list.work, list.first, later));
                 }
             }
+        }
+        if list.row_visible(focus) {
+            state.list_follow = false;
         }
         state.focus = Some((list.work, focus));
         // A copy of the game's own highlight (the user's choice,
@@ -6887,6 +6960,7 @@ mod tests {
             shown: 4,
             settled: true,
             cursor: 0,
+            snaps: true,
             menu_x: None,
             highlight: ListHighlight {
                 size: None,
@@ -7186,14 +7260,16 @@ mod tests {
         assert_eq!(judge_scroll(0.0, 0.0, true), ScrollOutcome::Still);
     }
 
-    /// One frame of `menumain`'s scroll (0x51224, the cursor at -1): at
-    /// 0.08 rows a frame or more, glide (position += speed, speed x 0.9);
-    /// below it, push toward the nearest row by min(0.005 / distance,
+    /// One frame of `menumain`'s scroll: at 0.08 rows a frame or more, or
+    /// always if the list has a cursor (`snaps` false), glide (position
+    /// += speed, speed x 0.9). With the cursor at -1 (0x51224), below
+    /// 0.08 push toward the nearest row by min(0.005 / distance,
     /// distance), added to the speed, and stop at a whole row as soon as
-    /// the position crosses one. Checked against the 2026-09-28 log.
-    fn menumain_step(position: f32, speed: f32, last: f32) -> (f32, f32) {
+    /// the position crosses one. Checked against the 2026-09-28 log (the
+    /// shop) and the 2026-09-29 one (Edit Troopers).
+    fn menumain_step(position: f32, speed: f32, last: f32, snaps: bool) -> (f32, f32) {
         let (mut position, mut speed) = (position, speed);
-        if speed.abs() < 0.08 {
+        if snaps && speed.abs() < 0.08 {
             let frac = position - position.floor();
             let push = if frac > 0.5 {
                 let d = 1.0 - frac;
@@ -7230,12 +7306,25 @@ mod tests {
     fn glide(position: f32, dy: f32) -> (f32, u32) {
         let (mut position, mut speed) = (position, -dy / 24.0);
         for frame in 1..200 {
-            (position, speed) = menumain_step(position, speed, 7.0);
+            (position, speed) = menumain_step(position, speed, 7.0, true);
             if speed == 0.0 {
                 return (position, frame);
             }
         }
         panic!("still gliding at {position}");
+    }
+
+    /// The same for a list with a cursor, which never snaps: where it is
+    /// once the controller counts it as still, and after how many frames.
+    fn coast(position: f32, dy: f32) -> (f32, u32) {
+        let (mut position, mut speed) = (position, -dy / 24.0);
+        for frame in 1..200 {
+            (position, speed) = menumain_step(position, speed, 7.0, false);
+            if list_still(speed, false) {
+                return (position, frame);
+            }
+        }
+        panic!("still coasting at {position}");
     }
 
     #[test]
@@ -7244,7 +7333,7 @@ mod tests {
         // turned back at 1.65 and ended on row 4, 47 frames later.
         let (mut position, mut speed) = (3.0, -0.2);
         for _ in 0..13 {
-            (position, speed) = menumain_step(position, speed, 7.0);
+            (position, speed) = menumain_step(position, speed, 7.0, true);
         }
         assert!((position - 1.6534).abs() < 0.001, "{position}");
         assert_eq!(glide(3.0, 4.8), (4.0, 47));
@@ -7258,6 +7347,122 @@ mod tests {
             assert!(frames <= 12, "{frames}");
             assert_eq!(glide(start, LIST_DRAG).0, start - 1.0);
         }
+    }
+
+    #[test]
+    fn a_list_with_a_cursor_coasts_without_snapping() {
+        // Edit Troopers' item list, 2026-09-29 (cursor 0): from row 0 a
+        // drag of 3.5 up went 0.14583333 (speed 0.13125), 0.27708334, ...
+        // and came to rest halfway between rows, at 1.4583331, its speed
+        // still not 0 two hundred frames later.
+        let (mut position, mut speed) = (0.0, 3.5 / 24.0);
+        (position, speed) = menumain_step(position, speed, 10.0, false);
+        assert!((position - 0.14583333).abs() < 1e-6, "{position}");
+        assert!((speed - 0.13125).abs() < 1e-6, "{speed}");
+        (position, speed) = menumain_step(position, speed, 10.0, false);
+        assert!((position - 0.27708334).abs() < 1e-6, "{position}");
+        for _ in 0..200 {
+            (position, speed) = menumain_step(position, speed, 10.0, false);
+        }
+        assert!((position - 1.4583331).abs() < 1e-5, "{position}");
+        assert_ne!(speed, 0.0);
+    }
+
+    #[test]
+    fn a_coast_counts_as_still_before_its_speed_reaches_zero() {
+        // Waiting for exactly 0 left the controller waiting for good.
+        assert!(list_still(0.0, false));
+        assert!(list_still(1e-10, false));
+        assert!(list_still(-1e-10, false));
+        // With about 5 points (0.12 rows) left to coast, near enough:
+        // the list finishes on its own.
+        assert!(list_still(0.011, false));
+        assert!(!list_still(0.05, false));
+        assert!(!list_still(-0.05, false));
+        // A snapping list does reach 0, and its snap can turn back
+        // through slow speeds on the way, so only 0 is still.
+        assert!(list_still(0.0, true));
+        assert!(!list_still(1e-10, true));
+    }
+
+    fn coasting(first: f32) -> ListMenu {
+        ListMenu {
+            snaps: false,
+            ..items(first)
+        }
+    }
+
+    fn drag_dy(list: &ListMenu, i: usize) -> f32 {
+        match list.scroll_toward(i) {
+            Some(Gesture::Drag { dy, .. }) => dy,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_list_with_a_cursor_is_dragged_onto_a_whole_row() {
+        // Row 6 from the top (4 shown): rows 3-6 are the nearest view.
+        // Counted as still with at most 0.12 rows to go (it rounds to the
+        // row, and the next drag aims from wherever it really is).
+        let dy = drag_dy(&coasting(0.0), 6);
+        let (on, frames) = coast(0.0, dy);
+        assert_eq!(on.round(), 3.0);
+        assert!((on - 3.0).abs() < 0.13, "{on}");
+        assert!(frames <= 32, "{frames}");
+        // Left alone it goes on to the row itself.
+        let (mut position, mut speed) = (0.0, -dy / 24.0);
+        for _ in 0..200 {
+            (position, speed) = menumain_step(position, speed, 7.0, false);
+        }
+        assert!((position - 3.0).abs() < 0.001, "{position}");
+        // One row: about 20 frames, where the 2026-09-29 log's took 30.
+        let (on, frames) = coast(2.0, drag_dy(&coasting(2.0), 6));
+        assert!((on - 3.0).abs() < 0.13, "{on}");
+        assert!(frames <= 22, "{frames}");
+        // Back up to row 0.
+        let (on, _) = coast(3.0, drag_dy(&coasting(3.0), 0));
+        assert!(on.abs() < 0.13, "{on}");
+        // From where the old drag left it, halfway between rows: onto
+        // the next whole row, not another half.
+        let halfway = 1.4583331;
+        let (on, _) = coast(halfway, drag_dy(&coasting(halfway), 5));
+        assert!((on - 2.0).abs() < 0.13, "{on}");
+        // And from where this one leaves it, short of the row: the
+        // next drag makes up the difference.
+        let short = 2.88;
+        let (on, _) = coast(short, drag_dy(&coasting(short), 7));
+        assert!((on - 4.0).abs() < 0.13, "{on}");
+    }
+
+    #[test]
+    fn a_list_moved_by_touch_takes_the_focus_along() {
+        // 2026-09-29: scrolled to the end by touch with the focus on row
+        // 0, and the controller dragged it straight back, over and over.
+        // Now the focus moves onto the rows shown instead.
+        assert_eq!(list_keep_focus(&items(4.0), 0, false), (4, None));
+        assert_eq!(list_keep_focus(&items(0.0), 7, false), (3, None));
+    }
+
+    #[test]
+    fn a_list_follows_the_focus_a_command_moved() {
+        // Down past the last row shown: scroll to it.
+        match list_keep_focus(&items(0.0), 4, true) {
+            (4, Some(Gesture::Drag { dy, .. })) => assert!(dy < 0.0),
+            other => panic!("{other:?}"),
+        }
+        // On screen, or still gliding: leave both alone.
+        assert_eq!(list_keep_focus(&items(0.0), 2, true), (2, None));
+        assert_eq!(list_keep_focus(&items(0.0), 2, false), (2, None));
+        let mut moving = items(4.0);
+        moving.settled = false;
+        assert_eq!(list_keep_focus(&moving, 0, false), (0, None));
+        assert_eq!(list_keep_focus(&moving, 0, true), (0, None));
+    }
+
+    #[test]
+    fn a_list_that_snaps_keeps_its_one_row_drag() {
+        assert_eq!(drag_dy(&items(0.0), 6), -LIST_DRAG);
+        assert_eq!(drag_dy(&items(3.0), 0), LIST_DRAG);
     }
 
     #[test]

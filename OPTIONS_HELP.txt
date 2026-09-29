@@ -8,6 +8,11 @@ View options:
         in use, the result may be a bit blurry. An internal resolution larger
         than your screen's is possible, in which case the output is downscaled.
 
+    --maximized
+        Open the window maximized instead of at the app's own size. The output
+        is scaled to fit, as when resizing the window by hand. Ignored with
+        --fullscreen, and on Android. Song Summoner uses this by default.
+
     --landscape-left
     --landscape-right
         Changes the orientation the virtual device will have at startup.

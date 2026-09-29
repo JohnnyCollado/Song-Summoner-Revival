@@ -29,7 +29,7 @@ crate-type = ["cdylib", "rlib"]
 # the Android .so) and the bin would both write touchHLE.pdb, which Cargo
 # warns about (rust-lang/cargo#6313). Renaming the lib instead would change
 # the module_path!() prefix on every log line and the Android library name.
-# `cargo dist-windows` ships this as touchHLE.exe.
+# `cargo dist-windows` ships this as S.S.Encore.exe.
 name = "touchHLE_bin"
 path = "src/bin.rs"
 

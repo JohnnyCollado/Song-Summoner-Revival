@@ -37,6 +37,8 @@ android/build
 Thumbs.db
 desktop.ini
 .claude/
+.agents/
+skills-lock.json
 CLAUDE.md
 CLAUDE.local.md
 AGENTS.md

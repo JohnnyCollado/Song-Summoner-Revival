@@ -47,6 +47,8 @@ pub enum ConfirmButton {
 #[derive(Clone)]
 pub struct Options {
     pub fullscreen: bool,
+    /// Open the window maximized (desktop, when not fullscreen).
+    pub maximized: bool,
     pub device_family: Option<DeviceFamily>,
     pub initial_orientation: DeviceOrientation,
     pub scale_hack: NonZeroU32,
@@ -91,6 +93,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             fullscreen: false,
+            maximized: false,
             device_family: None,
             initial_orientation: DeviceOrientation::Portrait,
             scale_hack: NonZeroU32::new(1).unwrap(),
@@ -144,6 +147,8 @@ impl Options {
 
         if arg == "--fullscreen" {
             self.fullscreen = true;
+        } else if arg == "--maximized" {
+            self.maximized = true;
         } else if arg == "--landscape-left" {
             self.initial_orientation = DeviceOrientation::LandscapeLeft;
         } else if arg == "--landscape-right" {
@@ -394,6 +399,26 @@ mod tests {
         assert_eq!(options.confirm_button, ConfirmButton::South);
         assert!(options.parse_argument("--confirm-button=A").is_err());
         assert_eq!(options.confirm_button, ConfirmButton::South);
+    }
+
+    #[test]
+    fn maximized_is_off_unless_asked_for() {
+        assert!(!Options::default().maximized);
+        let mut options = Options::default();
+        assert_eq!(options.parse_argument("--maximized"), Ok(true));
+        assert!(options.maximized);
+    }
+
+    #[test]
+    fn song_summoner_starts_maximized() {
+        // Its line in the shipped defaults (the Windows build copies this
+        // file next to S.S.Encore.exe).
+        let defaults = include_str!("../touchHLE_default_options.txt");
+        let line = defaults
+            .lines()
+            .find(|l| l.starts_with("com.square-enix.SongSummonerEncore:"))
+            .unwrap();
+        assert!(line.split_whitespace().any(|arg| arg == "--maximized"), "{line}");
     }
 
     #[test]
