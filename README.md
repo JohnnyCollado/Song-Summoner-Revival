@@ -13,11 +13,6 @@ cursor, the Setup menu on both platforms, and saves that survive an
 uninstall on Android. See the
 [release notes](dev-docs/releases/v0.2.3.md).
 
-Free, and always will be. If you'd like to support a solo developer
-(never required):
-
-[![Buy me a Taco](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20Taco&emoji=%F0%9F%8C%AE&slug=johnnycolli&button_colour=BD5FFF&font_colour=ffffff&font_family=Cookie&outline_colour=000000&coffee_colour=FFDD00)](https://www.buymeacoffee.com/johnnycolli)
-
 Design and background:
 
 - [`dev-docs/song-summoner-media-plan.md`](dev-docs/song-summoner-media-plan.md):
