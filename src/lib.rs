@@ -119,6 +119,55 @@ pub extern "C" fn SDL_main(
     0
 }
 
+/// Desktop, when no app was named: Song Summoner's IPA from the data folder,
+/// where the Setup menu keeps it. If it isn't there yet, ask for it (the
+/// way the Android wrapper does) and copy it there. `None` if the player
+/// cancels, which leaves touchHLE's app picker.
+#[cfg(not(target_os = "android"))]
+fn desktop_game_file() -> Option<PathBuf> {
+    let managed = frameworks::song_summoner::managed_game_file();
+    if managed.is_file() {
+        echo!("Using the game file {}", managed.display());
+        return Some(managed);
+    }
+    loop {
+        let picked = rfd::FileDialog::new()
+            .set_title("Choose your copy of Song Summoner (.ipa)")
+            .add_filter("iPhone app", &["ipa"])
+            .pick_file()?;
+        match frameworks::song_summoner::check_game_file(&picked) {
+            Ok(()) => {
+                let part = managed.with_extension("ipa.part");
+                let copied = std::fs::copy(&picked, &part)
+                    .and_then(|_| std::fs::rename(&part, &managed));
+                return match copied {
+                    Ok(()) => {
+                        echo!("Copied the game file to {}", managed.display());
+                        Some(managed)
+                    }
+                    Err(e) => {
+                        // Run it from where it is instead.
+                        let _ = std::fs::remove_file(&part);
+                        echo!("Couldn't copy the game file ({}), using it in place", e);
+                        Some(picked)
+                    }
+                };
+            }
+            Err(e) => {
+                let _ = rfd::MessageDialog::new()
+                    .set_title("That isn't the game")
+                    .set_description(format!("{e}. Choose the .ipa file of Song Summoner."))
+                    .show();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn desktop_game_file() -> Option<PathBuf> {
+    None
+}
+
 const USAGE: &str = "\
 Usage:
     touchHLE [PATH] [OPTIONS]
@@ -219,12 +268,18 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
                 "No app specified. Use the --help flag to see command-line usage.".to_string(),
             );
         }
-        echo!(
-            "No app specified, opening app picker. Use the --help flag to see command-line usage."
-        );
-        let (bundle_path, mut extra_options) = environment::app_picker::app_picker(options)?;
-        option_args.append(&mut extra_options);
-        bundle_path
+        match desktop_game_file() {
+            Some(path) => path,
+            None => {
+                echo!(
+                    "No app specified, opening app picker. Use the --help flag to see command-line usage."
+                );
+                let (bundle_path, mut extra_options) =
+                    environment::app_picker::app_picker(options)?;
+                option_args.append(&mut extra_options);
+                bundle_path
+            }
+        }
     };
 
     // When PowerShell does tab-completion on a directory, for some reason it
@@ -360,6 +415,12 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
     for option_arg in option_args {
         let parse_result = options.parse_argument(&option_arg);
         assert!(parse_result == Ok(true));
+    }
+
+    // Song Summoner's Setup menu settings (the stick's dead zone), and a
+    // save restore it asked for, before anything runs.
+    if app_id == "com.square-enix.SongSummonerEncore" {
+        frameworks::song_summoner::apply_at_startup(&mut options);
     }
 
     // The folder dialog has to come before the SDL window, and the scan runs

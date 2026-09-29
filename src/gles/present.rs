@@ -46,6 +46,122 @@ pub enum FocusShape {
     /// The diamond inscribed in it, traced from inside (a battle map tile,
     /// which is a 2:1 diamond).
     Diamond,
+    /// Filled like a game's own highlight: [LIST_HIGHLIGHT_COLOR] (a
+    /// `SysMenu` list's row highlight).
+    Highlight,
+}
+
+/// Song Summoner's list highlight colour (`SysMenu_Open` opens the sprite
+/// with `SysPrim_Set_Color(0x40f0f0f0)`): ARGB, a near-white at 25%.
+pub const LIST_HIGHLIGHT_COLOR: u32 = 0x40f0f0f0;
+
+/// How strongly the focus marker shows (Song Summoner's Setup menu, for
+/// players who find the game-style highlight hard to see).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorStyle {
+    /// As the game would: its translucent highlight, no edge.
+    #[default]
+    Game,
+    /// The highlight with a two-tone outline round it.
+    Outline,
+    /// A tinted fill and an outline twice as thick.
+    Bold,
+}
+
+impl CursorStyle {
+    pub const ALL: [CursorStyle; 3] = [CursorStyle::Game, CursorStyle::Outline, CursorStyle::Bold];
+}
+
+/// The focus marker's colour. All light, from a colour-blind-safe set
+/// (Okabe–Ito's yellow and sky blue), and always drawn over a dark border,
+/// so it stands out by brightness whatever colours a player sees.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorColour {
+    #[default]
+    Gold,
+    White,
+    Yellow,
+    Sky,
+}
+
+impl CursorColour {
+    pub const ALL: [CursorColour; 4] = [
+        CursorColour::Gold,
+        CursorColour::White,
+        CursorColour::Yellow,
+        CursorColour::Sky,
+    ];
+
+    pub fn rgb(self) -> [f32; 3] {
+        match self {
+            CursorColour::Gold => [1.0, 0.82, 0.25],
+            CursorColour::White => [1.0, 1.0, 1.0],
+            CursorColour::Yellow => [240.0 / 255.0, 228.0 / 255.0, 66.0 / 255.0],
+            CursorColour::Sky => [86.0 / 255.0, 180.0 / 255.0, 233.0 / 255.0],
+        }
+    }
+}
+
+/// The look the next frames draw the marker with (set from the settings;
+/// the renderer reads it each frame, on the same thread).
+static CURSOR_LOOK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_cursor_look(style: CursorStyle, colour: CursorColour) {
+    let style = CursorStyle::ALL.iter().position(|&s| s == style).unwrap_or(0);
+    let colour = CursorColour::ALL.iter().position(|&c| c == colour).unwrap_or(0);
+    CURSOR_LOOK.store((style * 4 + colour) as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn cursor_look() -> (CursorStyle, CursorColour) {
+    let packed = CURSOR_LOOK.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let style = CursorStyle::ALL.get(packed / 4).copied().unwrap_or_default();
+    let colour = CursorColour::ALL.get(packed % 4).copied().unwrap_or_default();
+    (style, colour)
+}
+
+/// The outline's thickness for a style, `base` being the brackets' line.
+fn outline_thickness(style: CursorStyle, base: f32) -> Option<f32> {
+    match style {
+        CursorStyle::Game => None,
+        CursorStyle::Outline => Some(base),
+        CursorStyle::Bold => Some(2.0 * base),
+    }
+}
+
+/// A closed frame `gap` outside `rect`, `t` thick: top, bottom, left and
+/// right quads (x, y, w, h).
+fn outline_edges(
+    (x, y, w, h): (f32, f32, f32, f32),
+    gap: f32,
+    t: f32,
+) -> [(f32, f32, f32, f32); 4] {
+    let (ox, oy) = (x - gap - t, y - gap - t);
+    let (ow, oh) = (w + 2.0 * (gap + t), h + 2.0 * (gap + t));
+    [
+        (ox, oy, ow, t),
+        (ox, oy + oh - t, ow, t),
+        (ox, oy + t, t, oh - 2.0 * t),
+        (ox + ow - t, oy + t, t, oh - 2.0 * t),
+    ]
+}
+
+/// An ARGB colour as premultiplied RGBA, for `glColor4f` with the
+/// `ONE, ONE_MINUS_SRC_ALPHA` blend used here.
+pub fn premultiplied(argb: u32) -> [f32; 4] {
+    let channel = |shift: u32| ((argb >> shift) & 0xff) as f32 / 255.0;
+    let a = channel(24);
+    [channel(16) * a, channel(8) * a, channel(0) * a, a]
+}
+
+/// An image drawn over the app: premultiplied RGBA `pixels`, stretched over
+/// `rect` (x, y, width, height), in fractions of the app's screen as shown
+/// (landscape if the app is), from the top left.
+#[derive(Clone)]
+pub struct Overlay {
+    pub pixels: std::rc::Rc<Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
+    pub rect: (f32, f32, f32, f32),
 }
 
 /// Where the focus marker is (x, y, width, height) and its shape.
@@ -66,6 +182,7 @@ pub unsafe fn present_frame(
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
     focus_marker: Option<FocusMarker>,
     debug_lines: &[((f32, f32), (f32, f32))],
+    overlays: &[Overlay],
 ) {
     // While this is a generic utility, it is closely tied to
     // crate::frameworks::opengles::eagl::present_renderbuffer, which handles
@@ -73,6 +190,11 @@ pub unsafe fn present_frame(
     // so these need to be updated in tandem.
 
     use gles11::types::*;
+
+    // The player's cursor look (Setup > Game > Cursor).
+    let (style, colour) = cursor_look();
+    let [cr, cg, cb] = colour.rgb();
+    let bold = style == CursorStyle::Bold;
 
     // Draw the quad
     gles.Viewport(
@@ -146,7 +268,7 @@ pub unsafe fn present_frame(
             gles.DrawArrays(gles11::TRIANGLES, 0, 6);
         };
         // Thickness scales with the window, about 1.5 points of the app.
-        let t = (vw.min(vh) as f32 / 213.0).max(1.5);
+        let t = (vw.min(vh) as f32 / 213.0).max(1.5) * if bold { 2.0 } else { 1.0 };
         let brackets = focus_brackets((x, y, w, h), t, t / 2.0);
         // Two tones, so it reads on both the game's light-blue panels and
         // its pale skies: a dark border all round, then a gold core. (Gold
@@ -157,7 +279,7 @@ pub unsafe fn present_frame(
             let (bx, by, bw, bh) = bracket_border(bracket, t);
             quad(gles, bx, by, bw, bh);
         }
-        gles.Color4f(1.0, 0.82, 0.25, 1.0);
+        gles.Color4f(cr, cg, cb, 1.0);
         for (bx, by, bw, bh) in brackets {
             quad(gles, bx, by, bw, bh);
         }
@@ -186,13 +308,55 @@ pub unsafe fn present_frame(
             gles.DrawArrays(gles11::TRIANGLES, 0, 24);
         };
         // As thick as the brackets.
-        let t = (vw.min(vh) as f32 / 213.0).max(1.5);
+        let t = (vw.min(vh) as f32 / 213.0).max(1.5) * if bold { 2.0 } else { 1.0 };
         // Premultiplied alpha.
         let a = 0.8;
         gles.Color4f(0.0, 0.0, 0.0, a);
         draw(gles, diamond_ring(diamond_grow(rect, t / 2.0), 2.0 * t));
-        gles.Color4f(1.0, 0.82, 0.25, 1.0);
+        gles.Color4f(cr, cg, cb, 1.0);
         draw(gles, diamond_ring(rect, t));
+        gles.Color4f(1.0, 1.0, 1.0, 1.0);
+    }
+
+    // A game-style highlight: the rectangle filled with the game's own
+    // translucent colour, so it looks like the game's.
+    if let Some(((x, y, w, h), FocusShape::Highlight)) = focus_marker {
+        let (vx, vy, vw, vh) = viewport;
+        let (x, y) = (x - vx as f32, y - vy as f32);
+        gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
+        gles.Disable(gles11::TEXTURE_2D);
+        gles.Enable(gles11::BLEND);
+        gles.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
+        let quad = |gles: &mut dyn GLES, (x, y, w, h): (f32, f32, f32, f32)| {
+            let (x0, x1) = (x / (vw as f32 / 2.0) - 1.0, (x + w) / (vw as f32 / 2.0) - 1.0);
+            let (y0, y1) = (1.0 - y / (vh as f32 / 2.0), 1.0 - (y + h) / (vh as f32 / 2.0));
+            let quad: [f32; 12] = [x0, y0, x1, y0, x0, y1, x1, y0, x0, y1, x1, y1];
+            gles.VertexPointer(2, gles11::FLOAT, 0, quad.as_ptr() as *const GLvoid);
+            gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+        };
+        // Bold tints the fill with the cursor colour, a little stronger.
+        let [r, g, b, a] = if bold {
+            let a = 0.3;
+            [cr * a, cg * a, cb * a, a]
+        } else {
+            premultiplied(LIST_HIGHLIGHT_COLOR)
+        };
+        gles.Color4f(r, g, b, a);
+        quad(gles, (x, y, w, h));
+        // The outline: a dark border, then the colour, just outside the
+        // highlight, so it reads on light and dark art alike.
+        let base = (vw.min(vh) as f32 / 213.0).max(1.5);
+        if let Some(t) = outline_thickness(style, base) {
+            let gap = base / 2.0;
+            gles.Color4f(0.0, 0.0, 0.0, 0.8);
+            for edge in outline_edges((x, y, w, h), gap - t / 2.0, 2.0 * t) {
+                quad(gles, edge);
+            }
+            gles.Color4f(cr, cg, cb, 1.0);
+            for edge in outline_edges((x, y, w, h), gap, t) {
+                quad(gles, edge);
+            }
+        }
         gles.Color4f(1.0, 1.0, 1.0, 1.0);
     }
 
@@ -223,6 +387,86 @@ pub unsafe fn present_frame(
         gles.DrawArrays(gles11::TRIANGLES, 0, (vertices.len() / 2) as _);
         gles.Color4f(1.0, 1.0, 1.0, 1.0);
     }
+
+    // Overlays (Song Summoner's Setup menu, its toast), over everything.
+    draw_overlays(gles, overlays);
+}
+
+/// Draw each overlay as a textured quad. Called last in [present_frame], so
+/// overlays sit over everything, and leaves no texture of its own bound.
+unsafe fn draw_overlays(gles: &mut dyn GLES, overlays: &[Overlay]) {
+    use gles11::types::*;
+    if overlays.is_empty() {
+        return;
+    }
+    gles.Enable(gles11::TEXTURE_2D);
+    gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+    gles.Enable(gles11::BLEND);
+    // Premultiplied alpha, like the rest of this file. MODULATE with white
+    // is the texture as is.
+    gles.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
+    gles.TexEnvi(
+        gles11::TEXTURE_ENV,
+        gles11::TEXTURE_ENV_MODE,
+        gles11::MODULATE as _,
+    );
+    gles.Color4f(1.0, 1.0, 1.0, 1.0);
+    // The caller's state backup doesn't cover this one, and the app's own
+    // texture uploads depend on it: put it back afterwards.
+    let mut old_alignment: GLint = 4;
+    gles.GetIntegerv(gles11::UNPACK_ALIGNMENT, &mut old_alignment);
+    gles.PixelStorei(gles11::UNPACK_ALIGNMENT, 4);
+    // Top-left first, like the image rows.
+    let tex_coords: [f32; 12] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+    gles.TexCoordPointer(2, gles11::FLOAT, 0, tex_coords.as_ptr() as *const GLvoid);
+    for overlay in overlays {
+        if overlay.pixels.len() < (overlay.width * overlay.height * 4) as usize {
+            continue;
+        }
+        let mut texture: GLuint = 0;
+        gles.GenTextures(1, &mut texture);
+        gles.BindTexture(gles11::TEXTURE_2D, texture);
+        gles.TexImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            gles11::RGBA as _,
+            overlay.width as _,
+            overlay.height as _,
+            0,
+            gles11::RGBA,
+            gles11::UNSIGNED_BYTE,
+            overlay.pixels.as_ptr() as *const GLvoid,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_MIN_FILTER,
+            gles11::LINEAR as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_MAG_FILTER,
+            gles11::LINEAR as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_S,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_T,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+        let (x, y, w, h) = overlay.rect;
+        let (x0, x1) = (x * 2.0 - 1.0, (x + w) * 2.0 - 1.0);
+        let (y0, y1) = (1.0 - y * 2.0, 1.0 - (y + h) * 2.0);
+        let quad: [f32; 12] = [x0, y0, x1, y0, x0, y1, x1, y0, x0, y1, x1, y1];
+        gles.VertexPointer(2, gles11::FLOAT, 0, quad.as_ptr() as *const GLvoid);
+        gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+        gles.BindTexture(gles11::TEXTURE_2D, 0);
+        gles.DeleteTextures(1, &texture);
+    }
+    gles.PixelStorei(gles11::UNPACK_ALIGNMENT, old_alignment);
 }
 
 /// Two triangles covering a line from `from` to `to`, `t` thick, or `None`
@@ -327,6 +571,64 @@ mod tests {
 
     fn contains(outer: Rect, p: (f32, f32)) -> bool {
         p.0 >= outer.0 && p.0 <= outer.0 + outer.2 && p.1 >= outer.1 && p.1 <= outer.1 + outer.3
+    }
+
+    #[test]
+    fn the_list_highlight_is_the_games_colour_premultiplied() {
+        // 0x40f0f0f0: alpha 0x40 (25%), near-white.
+        let [r, g, b, a] = premultiplied(LIST_HIGHLIGHT_COLOR);
+        let close = |x: f32, y: f32| (x - y).abs() < 1e-4;
+        assert!(close(a, 64.0 / 255.0), "{a}");
+        for c in [r, g, b] {
+            assert!(close(c, 240.0 / 255.0 * 64.0 / 255.0), "{c}");
+        }
+        assert_eq!(premultiplied(0xff000000), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(premultiplied(0), [0.0; 4]);
+    }
+
+    #[test]
+    fn cursor_colours_read_without_seeing_hue() {
+        // Every colour is light, and always drawn on a dark border, so the
+        // cursor stands out by brightness alone (any colour vision).
+        for colour in CursorColour::ALL {
+            let [r, g, b] = colour.rgb();
+            let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            assert!(luminance > 0.6, "{colour:?}: {luminance}");
+        }
+        // Gold is the marker's colour as it was.
+        assert_eq!(CursorColour::Gold.rgb(), [1.0, 0.82, 0.25]);
+        assert_eq!(CursorColour::default(), CursorColour::Gold);
+        assert_eq!(CursorStyle::default(), CursorStyle::Game);
+    }
+
+    #[test]
+    fn the_cursor_look_is_kept_for_the_next_frame() {
+        set_cursor_look(CursorStyle::Bold, CursorColour::Sky);
+        assert_eq!(cursor_look(), (CursorStyle::Bold, CursorColour::Sky));
+        set_cursor_look(CursorStyle::default(), CursorColour::default());
+        assert_eq!(cursor_look(), (CursorStyle::Game, CursorColour::Gold));
+    }
+
+    #[test]
+    fn the_outline_frames_the_rect_from_outside() {
+        let rect = (100.0, 50.0, 80.0, 40.0);
+        let edges = outline_edges(rect, 2.0, 3.0);
+        for edge in edges {
+            assert!(!overlaps(edge, rect), "{edge:?} covers the rect");
+        }
+        // Top, bottom, left, right: a closed frame 2 out, 3 thick.
+        assert_eq!(edges[0], (95.0, 45.0, 90.0, 3.0));
+        assert_eq!(edges[1], (95.0, 92.0, 90.0, 3.0));
+        assert_eq!(edges[2], (95.0, 48.0, 3.0, 44.0));
+        assert_eq!(edges[3], (182.0, 48.0, 3.0, 44.0));
+    }
+
+    #[test]
+    fn bold_is_thicker_than_outline_and_the_game_look_has_none() {
+        assert_eq!(outline_thickness(CursorStyle::Game, 2.0), None);
+        let outline = outline_thickness(CursorStyle::Outline, 2.0).unwrap();
+        let bold = outline_thickness(CursorStyle::Bold, 2.0).unwrap();
+        assert!(bold > outline && outline >= 2.0);
     }
 
     #[test]

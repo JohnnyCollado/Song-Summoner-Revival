@@ -19,7 +19,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicLong
 
-// Reads the music folder the user picked (a Storage Access Framework tree)
+// Reads the music folders the user picked (Storage Access Framework trees)
 // into the library index the engine loads: <user data>/library/index.tsv,
 // plus cover art in library/art/<id>.png.
 //
@@ -81,6 +81,31 @@ class LibraryScanner(private val context: Context, private val libraryDir: File)
             return out.toString()
         }
 
+        // A music folder's name for playlist names, from its tree's
+        // document ID ("primary:Music/OSTs" -> "OSTs").
+        fun rootName(treeDocumentId: String): String {
+            val path = treeDocumentId.substringAfter(':', treeDocumentId)
+                .trimEnd('/')
+            if (path.isEmpty()) {
+                return if (treeDocumentId.startsWith("primary")) {
+                    "Internal storage"
+                } else {
+                    "SD card"
+                }
+            }
+            return path.substringAfterLast('/')
+        }
+
+        // A song's playlist folder: with more than one music folder,
+        // named after its music folder first, so two "Rock" folders don't
+        // merge. Same rule as place() in src/media/scan_windows.rs.
+        fun folderFor(rootName: String, folder: String, rootCount: Int): String =
+            when {
+                rootCount <= 1 -> folder
+                folder.isEmpty() -> rootName
+                else -> "$rootName/$folder"
+            }
+
         fun unescape(s: String): String {
             val out = StringBuilder(s.length)
             var i = 0
@@ -124,10 +149,18 @@ class LibraryScanner(private val context: Context, private val libraryDir: File)
         val documentId: String,
         val uri: Uri,
         val name: String,
+        // Inside its music folder, for the album fallback.
+        val innerFolder: String,
+        // The playlist folder (see folderFor).
         val folder: String,
         val mtime: Long,
         val size: Long,
-    )
+    ) {
+        fun inRoot(rootName: String, rootCount: Int) = Found(
+            documentId, uri, name, innerFolder,
+            folderFor(rootName, innerFolder, rootCount), mtime, size,
+        )
+    }
 
     private val indexFile = File(libraryDir, "index.tsv")
     private val artDir = File(libraryDir, "art")
@@ -137,13 +170,19 @@ class LibraryScanner(private val context: Context, private val libraryDir: File)
     private val tagsNs = AtomicLong()
     private val artNs = AtomicLong()
 
-    // Scan the tree and write the index. onProgress(done, total) is called
-    // from this (worker) thread; total is -1 while the folders are still
-    // being listed. Returns the number of songs.
-    fun scan(treeUri: Uri, onProgress: (Int, Int) -> Unit): Int {
+    // Scan the music folders (trees) and write the index. onProgress(done,
+    // total) is called from this (worker) thread; total is -1 while the
+    // folders are still being listed. Returns the number of songs.
+    fun scan(trees: List<Uri>, onProgress: (Int, Int) -> Unit): Int {
         val start = System.nanoTime()
         onProgress(0, -1)
-        val found = listAudioFiles(treeUri)
+        val found = ArrayList<Found>()
+        for (tree in trees) {
+            val name = rootName(DocumentsContract.getTreeDocumentId(tree))
+            for (file in listAudioFiles(tree)) {
+                found.add(file.inRoot(name, trees.size))
+            }
+        }
         val listMs = msSince(start)
         Log.i(TAG, "media: found ${found.size} audio files")
 
@@ -167,7 +206,12 @@ class LibraryScanner(private val context: Context, private val libraryDir: File)
                 val old = previous[id]
                 if (old != null && old.mtime == file.mtime &&
                     old.size == file.size && old.locator == locator) {
-                    slots.add(old.copy(hasArt = old.hasArt && artFile(id).isFile))
+                    // Adding or removing a music folder renames playlists,
+                    // which needs no reading.
+                    slots.add(old.copy(
+                        hasArt = old.hasArt && artFile(id).isFile,
+                        folder = file.folder,
+                    ))
                 } else {
                     val job = Callable { readSong(file, id, locator) }
                     jobs.add(slots.size to pool.submit(job))
@@ -246,6 +290,7 @@ class LibraryScanner(private val context: Context, private val libraryDir: File)
                                 treeUri, docId
                             ),
                             name = name,
+                            innerFolder = folder,
                             folder = folder,
                             mtime = if (c.isNull(3)) 0 else c.getLong(3) / 1000,
                             size = if (c.isNull(4)) 0 else c.getLong(4),
@@ -262,7 +307,7 @@ class LibraryScanner(private val context: Context, private val libraryDir: File)
 
     private fun readSong(file: Found, id: Long, locator: String): Song {
         var title = file.name.substringBeforeLast('.')
-        var album = file.folder.substringAfterLast('/')
+        var album = file.innerFolder.substringAfterLast('/')
         var artist = ""
         var albumArtist = ""
         var genre = ""
@@ -290,7 +335,7 @@ class LibraryScanner(private val context: Context, private val libraryDir: File)
                 ?.substringBefore('/')?.trim()?.toIntOrNull() ?: 0
             picture = retriever.embeddedPicture
         } catch (e: Exception) {
-            Log.w(TAG, "media: no tags for ${file.folder}/${file.name}: $e")
+            Log.w(TAG, "media: no tags for ${file.innerFolder}/${file.name}: $e")
         } finally {
             try {
                 retriever.release()

@@ -33,4 +33,26 @@ class LibraryScannerTest {
         assertEquals(8, LibraryScanner.readThreads(12))
         assertEquals(8, LibraryScanner.readThreads(64))
     }
+
+    // Playlists are named after their music folder only when there are
+    // several, the same rule as the desktop scanner.
+    @Test
+    fun oneMusicFolderMeansNoPrefix() {
+        assertEquals("Rock/Live", LibraryScanner.folderFor("Music", "Rock/Live", 1))
+        assertEquals("", LibraryScanner.folderFor("Music", "", 1))
+    }
+
+    @Test
+    fun severalMusicFoldersPrefixTheirName() {
+        assertEquals("OSTs/Rock", LibraryScanner.folderFor("OSTs", "Rock", 2))
+        assertEquals("OSTs", LibraryScanner.folderFor("OSTs", "", 2))
+    }
+
+    @Test
+    fun musicFolderNamesComeFromTheTree() {
+        assertEquals("Music", LibraryScanner.rootName("primary:Music"))
+        assertEquals("OSTs", LibraryScanner.rootName("primary:Music/OSTs"))
+        assertEquals("Internal storage", LibraryScanner.rootName("primary:"))
+        assertEquals("SD card", LibraryScanner.rootName("1234-5678:"))
+    }
 }

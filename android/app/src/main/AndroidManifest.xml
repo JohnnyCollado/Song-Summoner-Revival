@@ -119,6 +119,16 @@
             -->
         </activity>
 
+        <!-- Restarts the app into SetupActivity when Song Summoner's Setup
+             menu needs a system picker (see RestartActivity.kt). Its own
+             process, so it outlives the game's. -->
+        <activity
+            android:name="org.touchhle.android.RestartActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:process=":restart"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <provider
             android:name="org.touchhle.android.DocumentsProvider"
             android:authorities="${applicationId}.provider"

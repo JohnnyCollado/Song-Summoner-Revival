@@ -299,6 +299,10 @@ android {
             include("cursor_*.png", "Cursor *.png")
             into("res")
         }
+        // The credits and the Square Enix notice, in the APK too.
+        from("${rootDir.parentFile}") {
+            include("CREDITS.txt")
+        }
         into(layout.buildDirectory.dir("generated/cursor_assets"))
     }
     tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }

@@ -5,9 +5,10 @@
  */
 //! The desktop music scanner (Windows, and any other non-Android host).
 //!
-//! At boot, before the SDL window exists, [prepare] asks for the music folder
-//! if none was chosen yet (or `--choose-music-folder` was passed), then reads
-//! the folder on a host thread while the app starts. Until the scan is done
+//! At boot, before the SDL window exists, [prepare] reads the music folders
+//! (`library/source.txt`) on a host thread while the app starts. It asks for
+//! a folder only with `--choose-music-folder`; otherwise folders are added
+//! in the Setup menu. Until the scan is done
 //! the engine serves the previous index, so the game can already count its
 //! songs; the new library is swapped in when the scan finishes.
 //!
@@ -30,16 +31,39 @@ use std::time::{Instant, UNIX_EPOCH};
 const MAX_READ_THREADS: usize = 8;
 
 pub fn prepare(force_dialog: bool) {
-    let saved = saved_folder();
-    let root = match saved {
-        Some(ref folder) if !force_dialog && folder.is_dir() => Some(folder.clone()),
-        _ => ask_for_folder(saved.as_deref()).or(saved),
+    let saved: Vec<PathBuf> = super::source::roots()
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    // With no folder yet, nothing is asked here: the first launch opens the
+    // Setup menu on its Music tab instead.
+    let roots = if force_dialog {
+        match ask_for_folder(saved.first().map(PathBuf::as_path)) {
+            // `--choose-music-folder` replaces the folders with the one
+            // picked; the Setup menu is the place to add more.
+            Some(folder) => {
+                let roots = vec![folder.to_string_lossy().into_owned()];
+                if let Err(e) = super::source::write_roots(&roots) {
+                    log!("media: couldn't save {}: {}", super::source_path().display(), e);
+                }
+                vec![folder]
+            }
+            None => saved,
+        }
+    } else {
+        saved
     };
-    let Some(root) = root else {
+    if roots.is_empty() {
         log!("media: no music folder chosen, the music library stays empty");
         return;
-    };
-    log!("media: music folder is {}", root.display());
+    }
+    for root in &roots {
+        if root.is_dir() {
+            log!("media: music folder {}", root.display());
+        } else {
+            log!("media: music folder {} is missing, skipped", root.display());
+        }
+    }
 
     // Load the previous index now, so the game gets it while we rescan.
     let previous = library::current();
@@ -47,7 +71,7 @@ pub fn prepare(force_dialog: bool) {
     let spawned = std::thread::Builder::new()
         .name("touchHLE music scan".to_string())
         .spawn(move || {
-            let library = scan(&root, &previous);
+            let library = scan(&roots, &previous);
             library::publish(library);
             library::set_scanning(false);
         });
@@ -57,35 +81,62 @@ pub fn prepare(force_dialog: bool) {
     }
 }
 
-fn saved_folder() -> Option<PathBuf> {
-    let text = std::fs::read_to_string(super::source_path()).ok()?;
-    let text = text.trim();
-    (!text.is_empty()).then(|| PathBuf::from(text))
-}
-
-/// Show the native "Select folder" dialog and remember the answer in
-/// `library/source.txt`. `None` if the user cancelled.
-fn ask_for_folder(previous: Option<&Path>) -> Option<PathBuf> {
+/// Show the native "Select folder" dialog. `None` if the user cancelled.
+pub fn ask_for_folder(previous: Option<&Path>) -> Option<PathBuf> {
     log!("media: asking for the music folder");
     let mut dialog = rfd::FileDialog::new().set_title("Choose the folder with your music");
     if let Some(previous) = previous.filter(|p| p.is_dir()) {
         dialog = dialog.set_directory(previous);
     }
-    let folder = dialog.pick_folder()?;
-    let saved = std::fs::create_dir_all(super::library_dir())
-        .and_then(|_| std::fs::write(super::source_path(), folder.to_string_lossy().as_bytes()));
-    if let Err(e) = saved {
-        log!("media: couldn't save {}: {}", super::source_path().display(), e);
-    }
-    Some(folder)
+    dialog.pick_folder()
 }
 
 struct Found {
     path: PathBuf,
-    /// Relative to the music folder, `/`-separated.
+    /// Relative to its music folder, `/`-separated.
     relative: String,
+    /// What the index stores: see [place].
+    locator: String,
+    /// What the persistent ID is made from.
+    key: String,
+    /// The Playlist tab's folder.
+    folder: String,
     mtime: u64,
     size: u64,
+}
+
+/// Where a file found at `relative` in music folder `index` (of `count`,
+/// at `root`) goes in the index: its locator, ID key and playlist folder.
+///
+/// The first folder's songs keep folder-relative locators, so a library
+/// indexed before there could be several folders keeps its IDs (the game
+/// remembers songs by ID). The others use full paths. With more than one
+/// folder, playlists are named after their music folder first, so two
+/// "Rock" folders don't merge.
+fn place(relative: &str, index: usize, root: &Path, count: usize) -> (String, String, String) {
+    let locator = if index == 0 {
+        relative.to_string()
+    } else {
+        let mut path = root.to_path_buf();
+        path.extend(relative.split('/'));
+        path.to_string_lossy().into_owned()
+    };
+    let key = locator.to_lowercase();
+    let inner = relative.rsplit_once('/').map_or("", |(folder, _)| folder);
+    let folder = if count > 1 {
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root.to_string_lossy().into_owned());
+        if inner.is_empty() {
+            name
+        } else {
+            format!("{name}/{inner}")
+        }
+    } else {
+        inner.to_string()
+    };
+    (locator, key, folder)
 }
 
 fn walk(dir: &Path, relative: &str, depth: u32, out: &mut Vec<Found>) {
@@ -129,6 +180,9 @@ fn walk(dir: &Path, relative: &str, depth: u32, out: &mut Vec<Found>) {
             .unwrap_or(0);
         out.push(Found {
             path,
+            locator: child.clone(),
+            key: child.to_lowercase(),
+            folder: String::new(),
             relative: child,
             mtime,
             size: meta.len(),
@@ -153,9 +207,9 @@ impl ReadTimes {
     }
 }
 
-fn scan(root: &Path, previous: &Library) -> Library {
+fn scan(roots: &[PathBuf], previous: &Library) -> Library {
     let start = Instant::now();
-    let found = list_audio_files(root);
+    let found = list_all(roots);
     let walk_time = start.elapsed();
     log!("media: found {} audio files", found.len());
 
@@ -195,12 +249,35 @@ fn scan(root: &Path, previous: &Library) -> Library {
     Library::new(songs)
 }
 
-/// The playable audio files under `root`, sorted by relative path.
+/// The playable audio files under `root`, sorted by relative path, placed
+/// as a single music folder.
 fn list_audio_files(root: &Path) -> Vec<Found> {
     let mut found = Vec::new();
     walk(root, "", 0, &mut found);
     found.sort_by(|a, b| a.relative.cmp(&b.relative));
+    for file in &mut found {
+        (file.locator, file.key, file.folder) = place(&file.relative, 0, root, 1);
+    }
     found
+}
+
+/// The playable audio files in every music folder, folder by folder.
+/// Missing folders are skipped (an unplugged drive shouldn't stop the
+/// others from loading).
+fn list_all(roots: &[PathBuf]) -> Vec<Found> {
+    let mut all = Vec::new();
+    for (index, root) in roots.iter().enumerate() {
+        if !root.is_dir() {
+            continue;
+        }
+        let mut found = list_audio_files(root);
+        for file in &mut found {
+            (file.locator, file.key, file.folder) =
+                place(&file.relative, index, root, roots.len());
+        }
+        all.extend(found);
+    }
+    all
 }
 
 /// What [build_songs] decided.
@@ -236,17 +313,20 @@ where
     let mut to_read = Vec::new();
     let mut seen = HashSet::new();
     for file in found {
-        let id = index::persistent_id(&file.relative.to_lowercase());
+        let id = index::persistent_id(&file.key);
         if !seen.insert(id) {
             continue;
         }
         let unchanged = old.get(&id).filter(|s| {
-            s.mtime == file.mtime && s.size == file.size && s.locator == file.relative
+            s.mtime == file.mtime && s.size == file.size && s.locator == file.locator
         });
         match unchanged {
             Some(&song) => {
                 let mut song = song.clone();
                 song.has_art = song.has_art && has_art_file(id);
+                // Adding or removing a music folder renames playlists,
+                // which needs no reading.
+                song.folder = file.folder.clone();
                 slots.push(Some(song));
             }
             None => {
@@ -312,24 +392,24 @@ where
 }
 
 fn read_song(file: &Found, id: u64, times: &ReadTimes) -> Song {
-    let (folder, file_name) = match file.relative.rsplit_once('/') {
-        Some((folder, name)) => (folder.to_string(), name),
-        None => (String::new(), file.relative.as_str()),
+    let (inner, file_name) = match file.relative.rsplit_once('/') {
+        Some((folder, name)) => (folder, name),
+        None => ("", file.relative.as_str()),
     };
     let stem = file_name
         .rsplit_once('.')
         .map_or(file_name, |(stem, _)| stem)
         .to_string();
-    let parent_name = folder.rsplit('/').next().unwrap_or("").to_string();
+    let parent_name = inner.rsplit('/').next().unwrap_or("").to_string();
 
     let mut song = Song {
         id,
-        locator: file.relative.clone(),
+        locator: file.locator.clone(),
         mtime: file.mtime,
         size: file.size,
         title: stem,
         album: parent_name,
-        folder,
+        folder: file.folder.clone(),
         ..Default::default()
     };
     let tags_start = Instant::now();
@@ -438,12 +518,80 @@ mod tests {
     use std::time::Duration;
 
     fn found(relative: &str, mtime: u64, size: u64) -> Found {
+        let (locator, key, folder) = place(relative, 0, Path::new("music"), 1);
         Found {
             path: PathBuf::from(relative),
             relative: relative.to_string(),
+            locator,
+            key,
+            folder,
             mtime,
             size,
         }
+    }
+
+    /// A file in music folder `index` of `count`, at `root`.
+    fn found_in(root: &str, index: usize, count: usize, relative: &str) -> Found {
+        let (locator, key, folder) = place(relative, index, Path::new(root), count);
+        Found {
+            path: Path::new(root).join(relative),
+            relative: relative.to_string(),
+            locator,
+            key,
+            folder,
+            mtime: 1,
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn the_first_folder_keeps_relative_locators_and_ids() {
+        let root = std::env::temp_dir().join("first");
+        let (locator, key, folder) = place("Rock/a.mp3", 0, &root, 2);
+        assert_eq!(locator, "Rock/a.mp3");
+        // The same ID as before there could be several folders.
+        assert_eq!(key, "rock/a.mp3");
+        assert_eq!(folder, "first/Rock");
+    }
+
+    #[test]
+    fn other_folders_use_full_paths() {
+        let root = std::env::temp_dir().join("second");
+        let (locator, key, folder) = place("Rock/a.mp3", 1, &root, 2);
+        assert_eq!(PathBuf::from(&locator), root.join("Rock").join("a.mp3"));
+        assert_eq!(key, locator.to_lowercase());
+        assert_eq!(folder, "second/Rock");
+        // Top-level songs are a playlist named after their folder.
+        assert_eq!(place("b.mp3", 1, &root, 2).2, "second");
+    }
+
+    #[test]
+    fn one_folder_means_no_prefix() {
+        assert_eq!(place("Rock/Live/a.mp3", 0, Path::new("m"), 1).2, "Rock/Live");
+        assert_eq!(place("a.mp3", 0, Path::new("m"), 1).2, "");
+    }
+
+    #[test]
+    fn the_same_path_in_two_folders_is_two_songs() {
+        let tmp = std::env::temp_dir();
+        let a = tmp.join("a").to_string_lossy().into_owned();
+        let b = tmp.join("b").to_string_lossy().into_owned();
+        let files = vec![found_in(&a, 0, 2, "song.mp3"), found_in(&b, 1, 2, "song.mp3")];
+        let built = build_songs(&files, &Library::default(), |_| true, fake_read, &no_progress);
+        assert_eq!(built.songs.len(), 2);
+        assert_ne!(built.songs[0].id, built.songs[1].id);
+    }
+
+    #[test]
+    fn adding_a_folder_renames_playlists_without_rereading() {
+        let mut old = indexed("Rock/a.mp3", 1, 1, "kept");
+        old.folder = "Rock".to_string();
+        let previous = Library::new(vec![old]);
+        let files = vec![found_in("C:/Music", 0, 2, "Rock/a.mp3")];
+        let built = build_songs(&files, &previous, |_| true, fake_read, &no_progress);
+        assert_eq!(built.read, 0);
+        assert_eq!(built.songs[0].title, "kept");
+        assert_eq!(built.songs[0].folder, "Music/Rock");
     }
 
     fn id_of(relative: &str) -> u64 {
@@ -466,7 +614,7 @@ mod tests {
     fn fake_read(file: &Found, id: u64) -> Song {
         Song {
             id,
-            locator: file.relative.clone(),
+            locator: file.locator.clone(),
             mtime: file.mtime,
             size: file.size,
             title: format!("read {}", file.relative),

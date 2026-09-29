@@ -543,6 +543,24 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
     (pixel_buffer, width_u32, height_u32)
 }
 
+/// Show the app's last frame again, with the window's current overlays.
+/// For Song Summoner's Setup menu, which pauses the game (so it presents
+/// nothing) but still has to be drawn. Only for apps that present straight
+/// to a fullscreen layer, as that game does; otherwise does nothing.
+pub fn present_again(env: &mut Environment) {
+    if env.window.is_none() {
+        return;
+    }
+    if find_fullscreen_eagl_layer(env) == nil {
+        return;
+    }
+    // SAFETY: as for presentRenderbuffer:, the app's context is current and
+    // its renderbuffer bound, since this runs from inside its frame timer.
+    unsafe {
+        present_renderbuffer(env);
+    }
+}
+
 /// Copies the pixels in a renderbuffer bound to `GL_RENDERBUFFER_BINDING_OES`
 /// (which should be provided by the app) to a texture and presents it with
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
@@ -554,6 +572,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
     let focus_marker = env.window.as_mut().unwrap().focus_marker_visible_at();
     let debug_lines = env.window.as_mut().unwrap().debug_lines_visible_at();
+    let overlays = env.window.as_mut().unwrap().overlays();
 
     let gles_ctx = super::get_thread_context(
         &mut env.framework_state.opengles,
@@ -688,6 +707,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         virtual_cursor_visible_at,
         focus_marker,
         &debug_lines,
+        &overlays,
     );
 
     // Clean up the texture

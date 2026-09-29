@@ -12,7 +12,7 @@
 //! window system interaction in general, because it is assumed only one window
 //! will be needed for the runtime of the app.
 
-use crate::gles::present::{present_frame, FocusMarker};
+use crate::gles::present::{present_frame, FocusMarker, Overlay};
 use crate::gles::{create_gles1_ctx_no_parent_stack, GLESContext, GLES};
 use crate::image::Image;
 use crate::matrix::Matrix;
@@ -27,7 +27,23 @@ use std::env;
 use std::f32::consts::FRAC_PI_2;
 use std::num::NonZeroU32;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Set by the Android gear button (`MainActivity.nativeOpenSetupMenu`,
+/// from the UI thread) and turned into [Event::OpenSetupMenu] at the next
+/// poll.
+static SETUP_MENU_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// JNI: the gear button over the game was tapped.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_org_touchhle_android_MainActivity_nativeOpenSetupMenu(
+    _env: *mut std::ffi::c_void,
+    _class: *mut std::ffi::c_void,
+) {
+    SETUP_MENU_REQUESTED.store(true, Ordering::Relaxed);
+}
 
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -205,6 +221,94 @@ pub fn trigger_edge(was_down: bool, value: f32) -> Option<bool> {
     }
 }
 
+/// The D-pad direction the left stick counts as, given the one it counted
+/// as before (`was`) and where it is now (-1 to 1 each way, y down). Like
+/// the triggers: pushed past half-way presses the direction of whichever
+/// axis is pushed further, and it stays pressed until it's back below a
+/// quarter, so a stick resting part-way doesn't chatter.
+pub fn stick_dpad(was: Option<PadButton>, x: f32, y: f32) -> Option<PadButton> {
+    let (dominant, direction) = if x.abs() >= y.abs() {
+        (
+            x.abs(),
+            if x < 0.0 {
+                PadButton::DPadLeft
+            } else {
+                PadButton::DPadRight
+            },
+        )
+    } else {
+        (
+            y.abs(),
+            if y < 0.0 {
+                PadButton::DPadUp
+            } else {
+                PadButton::DPadDown
+            },
+        )
+    };
+    if dominant > 0.5 {
+        return Some(direction);
+    }
+    let along = |b: PadButton| match b {
+        PadButton::DPadLeft => -x,
+        PadButton::DPadRight => x,
+        PadButton::DPadUp => -y,
+        PadButton::DPadDown => y,
+        _ => 0.0,
+    };
+    was.filter(|&b| along(b) >= 0.25)
+}
+
+/// The D-pad and the left stick as one set of directions: a direction is
+/// down while either holds it, so holding both never presses it twice.
+#[derive(Default, Debug)]
+pub struct Directions {
+    dpad: [bool; 4],
+    stick: Option<PadButton>,
+}
+
+const DIRECTIONS: [PadButton; 4] = [
+    PadButton::DPadUp,
+    PadButton::DPadDown,
+    PadButton::DPadLeft,
+    PadButton::DPadRight,
+];
+
+impl Directions {
+    fn index(b: PadButton) -> usize {
+        DIRECTIONS.iter().position(|&d| d == b).unwrap()
+    }
+    fn down(&self, b: PadButton) -> bool {
+        self.dpad[Self::index(b)] || self.stick == Some(b)
+    }
+    pub fn stick(&self) -> Option<PadButton> {
+        self.stick
+    }
+    /// A D-pad button went down or up: the press or release to send, if
+    /// the direction changed.
+    pub fn set_dpad(&mut self, b: PadButton, pressed: bool) -> Option<(PadButton, bool)> {
+        let before = self.down(b);
+        self.dpad[Self::index(b)] = pressed;
+        let after = self.down(b);
+        (before != after).then_some((b, after))
+    }
+    /// The stick now points `dir`: the releases, then presses, to send.
+    pub fn set_stick(&mut self, dir: Option<PadButton>) -> Vec<(PadButton, bool)> {
+        let before = DIRECTIONS.map(|b| self.down(b));
+        self.stick = dir;
+        let after = DIRECTIONS.map(|b| self.down(b));
+        let mut out = Vec::new();
+        for pressed in [false, true] {
+            for i in 0..4 {
+                if before[i] != after[i] && after[i] == pressed {
+                    out.push((DIRECTIONS[i], pressed));
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Debug)]
 pub enum TextInputEvent {
     Text(String),
@@ -239,6 +343,13 @@ pub enum Event {
         /// which make's button icons to draw.
         controller_type: u32,
     },
+    /// A key went down or up (desktop, or a keyboard connected to an
+    /// Android device), by SDL scancode name ("W",
+    /// "Return"). Held-key repeats aren't sent. F2, F11 and F12 aren't
+    /// either: they're touchHLE's own.
+    Key { key: String, pressed: bool },
+    /// F2, or the Android gear button: open Song Summoner's Setup menu.
+    OpenSetupMenu,
 }
 
 pub enum BatteryState {
@@ -314,6 +425,14 @@ pub struct Window {
     stick_active: bool,
     /// Whether L2 and R2 are pulled, as buttons (see [trigger_edge]).
     triggers_down: [bool; 2],
+    /// The D-pad and the left stick, merged (see [Directions]).
+    directions: Directions,
+    /// Images drawn over the app, like Song Summoner's Setup menu (see
+    /// [Self::set_overlays]).
+    overlays: Vec<Overlay>,
+    /// An app text field has the keyboard (see [Self::start_text_input]),
+    /// so keys are typing, not controls.
+    text_input_active: std::cell::Cell<bool>,
     _sensor_ctx: sdl2::SensorSubsystem,
     accelerometer: Option<sdl2::sensor::Sensor>,
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
@@ -485,6 +604,9 @@ impl Window {
             },
             stick_active: false,
             triggers_down: [false; 2],
+            directions: Directions::default(),
+            overlays: Vec::new(),
+            text_input_active: std::cell::Cell::new(false),
             _sensor_ctx: sensor_ctx,
             accelerometer,
             virtual_cursor_last: None,
@@ -607,6 +729,10 @@ impl Window {
             (screen_width as f32 * x, screen_height as f32 * y)
         }
 
+        if SETUP_MENU_REQUESTED.swap(false, Ordering::Relaxed) {
+            self.event_queue.push_back(Event::OpenSetupMenu);
+        }
+
         let mut controller_updated = false;
         // event_pump doesn't have a method to peek on events
         // so, we keep track of an unconsumed one from a previous loop iteration
@@ -665,11 +791,67 @@ impl Window {
                 E::ControllerButtonDown { which, button, .. }
                 | E::ControllerButtonUp { which, button, .. } => {
                     if let Some(button) = translate_pad_button(button) {
+                        let pressed = matches!(event, E::ControllerButtonDown { .. });
+                        // Directions go through the merge with the stick.
+                        let change = if DIRECTIONS.contains(&button) {
+                            self.directions.set_dpad(button, pressed)
+                        } else {
+                            Some((button, pressed))
+                        };
+                        if let Some((button, pressed)) = change {
+                            self.event_queue.push_back(Event::ControllerButton {
+                                button,
+                                pressed,
+                                controller_type: controller_type(which),
+                            });
+                        }
+                    }
+                }
+                // The left stick mirrors the D-pad in touchHLE's menus.
+                E::ControllerAxisMotion { which, axis, .. }
+                    if matches!(
+                        axis,
+                        sdl2::controller::Axis::LeftX | sdl2::controller::Axis::LeftY
+                    ) =>
+                {
+                    let (x, y, _) = self.get_controller_stick(options, true);
+                    let dir = stick_dpad(self.directions.stick(), x, y);
+                    for (button, pressed) in self.directions.set_stick(dir) {
                         self.event_queue.push_back(Event::ControllerButton {
                             button,
-                            pressed: matches!(event, E::ControllerButtonDown { .. }),
+                            pressed,
                             controller_type: controller_type(which),
                         });
+                    }
+                }
+                // Keys for Song Summoner's controls and Setup menu, on
+                // desktops and from a Bluetooth or USB keyboard on Android
+                // (SDL sends pads' buttons as controller events, not
+                // keys). The text-input handling below still sees the
+                // same event.
+                E::KeyDown {
+                    scancode: Some(scancode),
+                    repeat: false,
+                    ..
+                }
+                | E::KeyUp {
+                    scancode: Some(scancode),
+                    repeat: false,
+                    ..
+                } => {
+                    use sdl2::keyboard::Scancode;
+                    let pressed = matches!(event, E::KeyDown { .. });
+                    match scancode {
+                        Scancode::F2 => {
+                            if pressed {
+                                self.event_queue.push_back(Event::OpenSetupMenu);
+                            }
+                        }
+                        Scancode::F11 | Scancode::F12 => (),
+                        _ => self.event_queue.push_back(Event::Key {
+                            key: scancode.name().to_string(),
+                            pressed,
+                        }),
                     }
                 }
                 // The triggers are axes; touchHLE's menus want them as
@@ -992,22 +1174,7 @@ impl Window {
                     // We use Desktop (borderless, same resolution) rather
                     // than True (mode-switching) — quicker toggle, no
                     // resolution flicker.
-                    if !Self::rotatable_fullscreen() {
-                        let new_state = if self.fullscreen {
-                            sdl2::video::FullscreenType::Off
-                        } else {
-                            sdl2::video::FullscreenType::Desktop
-                        };
-                        if let Err(e) = self.window.set_fullscreen(new_state) {
-                            log!("Couldn't toggle fullscreen: {}", e);
-                        } else {
-                            self.fullscreen = !self.fullscreen;
-                            echo!(
-                                "F11: window is now {}.",
-                                if self.fullscreen { "fullscreen" } else { "windowed" }
-                            );
-                        }
-                    }
+                    self.toggle_fullscreen();
                     continue;
                 }
                 E::KeyDown {
@@ -1215,6 +1382,71 @@ impl Window {
             (x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs()),
             shape,
         ))
+    }
+
+    /// Toggle borderless fullscreen (F11, or Song Summoner's Setup menu).
+    /// Does nothing on Android, which is always fullscreen.
+    pub fn toggle_fullscreen(&mut self) {
+        if Self::rotatable_fullscreen() {
+            return;
+        }
+        let new_state = if self.fullscreen {
+            sdl2::video::FullscreenType::Off
+        } else {
+            sdl2::video::FullscreenType::Desktop
+        };
+        if let Err(e) = self.window.set_fullscreen(new_state) {
+            log!("Couldn't toggle fullscreen: {}", e);
+        } else {
+            self.fullscreen = !self.fullscreen;
+            echo!(
+                "Window is now {}.",
+                if self.fullscreen {
+                    "fullscreen"
+                } else {
+                    "windowed"
+                }
+            );
+        }
+    }
+
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen
+    }
+
+    /// Draw images over the app, each stretched over its rectangle of the
+    /// app's (landscape, as shown) screen, in fractions of it. They stay
+    /// until changed; an empty list stops.
+    pub fn set_overlays(&mut self, overlays: Vec<Overlay>) {
+        self.overlays = overlays;
+    }
+
+    /// For use when redrawing the screen.
+    pub fn overlays(&self) -> Vec<Overlay> {
+        self.overlays.clone()
+    }
+
+    /// Where a point of the app's portrait screen (as touch events give
+    /// them) is on the app's screen as shown, in fractions of it (0 to 1,
+    /// from the top left).
+    pub fn screen_point_to_shown_fraction(&self, point: (f32, f32)) -> (f32, f32) {
+        let viewport = self.viewport();
+        let (x, y) = screen_to_viewport(
+            point,
+            viewport,
+            &self.rotation_matrix(),
+            self.size_unrotated_unscaled(),
+        );
+        let (vx, vy, vw, vh) = viewport;
+        (
+            (x - vx as f32) / vw.max(1) as f32,
+            (y - vy as f32) / vh.max(1) as f32,
+        )
+    }
+
+    /// Whether an app text field has the keyboard.
+    pub fn is_text_input_active(&self) -> bool {
+        self.text_input_active.get()
     }
 
     /// Draw lines over the app (from, to, in portrait screen points, like
@@ -1496,6 +1728,7 @@ impl Window {
                 /* virtual_cursor_visible_at: */ None,
                 /* focus_marker: */ None,
                 /* debug_lines: */ &[],
+                /* overlays: */ &[],
             );
 
             gl_ctx.DeleteTextures(1, &texture);
@@ -1670,12 +1903,14 @@ impl Window {
 
     pub fn start_text_input(&self) {
         assert!(self.on_main_stack);
+        self.text_input_active.set(true);
         unsafe {
             sdl2_sys::SDL_StartTextInput();
         }
     }
     pub fn stop_text_input(&self) {
         assert!(self.on_main_stack);
+        self.text_input_active.set(false);
         unsafe {
             sdl2_sys::SDL_StopTextInput();
         }
@@ -1824,6 +2059,56 @@ mod tests {
         let rotation = Matrix::z_rotation(-FRAC_PI_2);
         let (x, y) = screen_to_viewport((160.0, 240.0), viewport, &rotation, SCREEN);
         assert!((x - 520.0).abs() < 0.01 && (y - 330.0).abs() < 0.01, "{x} {y}");
+    }
+
+    #[test]
+    fn stick_presses_past_half_and_releases_below_a_quarter() {
+        assert_eq!(stick_dpad(None, 0.3, 0.0), None);
+        assert_eq!(stick_dpad(None, 0.6, 0.0), Some(PadButton::DPadRight));
+        assert_eq!(stick_dpad(None, -0.6, 0.0), Some(PadButton::DPadLeft));
+        assert_eq!(stick_dpad(None, 0.0, -0.6), Some(PadButton::DPadUp));
+        assert_eq!(stick_dpad(None, 0.0, 0.6), Some(PadButton::DPadDown));
+        // Held part-way, it stays down until under 25%.
+        let right = Some(PadButton::DPadRight);
+        assert_eq!(stick_dpad(right, 0.4, 0.0), right);
+        assert_eq!(stick_dpad(right, 0.26, 0.1), right);
+        assert_eq!(stick_dpad(right, 0.2, 0.0), None);
+        // From rest, part-way does nothing.
+        assert_eq!(stick_dpad(None, 0.4, 0.4), None);
+    }
+
+    #[test]
+    fn diagonals_take_the_axis_pushed_further() {
+        assert_eq!(stick_dpad(None, 0.6, 0.7), Some(PadButton::DPadDown));
+        assert_eq!(stick_dpad(None, -0.8, 0.7), Some(PadButton::DPadLeft));
+        // Swinging round to the other axis switches direction.
+        let right = Some(PadButton::DPadRight);
+        assert_eq!(stick_dpad(right, 0.3, -0.9), Some(PadButton::DPadUp));
+    }
+
+    #[test]
+    fn stick_and_dpad_together_press_once() {
+        let mut d = Directions::default();
+        assert_eq!(
+            d.set_dpad(PadButton::DPadUp, true),
+            Some((PadButton::DPadUp, true))
+        );
+        // The stick joins in: already down, nothing new.
+        assert!(d.set_stick(Some(PadButton::DPadUp)).is_empty());
+        // The D-pad lets go while the stick holds: still down.
+        assert_eq!(d.set_dpad(PadButton::DPadUp, false), None);
+        // The stick lets go: now it's released.
+        assert_eq!(d.set_stick(None), vec![(PadButton::DPadUp, false)]);
+    }
+
+    #[test]
+    fn stick_switching_direction_releases_then_presses() {
+        let mut d = Directions::default();
+        d.set_stick(Some(PadButton::DPadLeft));
+        assert_eq!(
+            d.set_stick(Some(PadButton::DPadUp)),
+            vec![(PadButton::DPadLeft, false), (PadButton::DPadUp, true)]
+        );
     }
 
     #[test]

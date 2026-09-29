@@ -1,0 +1,66 @@
+SONG SUMMONER REVIVAL: CREDITS AND LEGAL NOTICE
+===============================================
+
+The same text is in the game's Setup menu (Credits tab). Open the menu with
+F2 or Select + Start on Windows, or with Select + Start or the gear button on
+Android.
+
+
+Emulator: touchHLE
+------------------
+
+Song Summoner Revival is built on touchHLE, a high-level emulator for
+iPhone OS apps.
+
+  touchHLE © 2023–2026 touchHLE project contributors.
+  License: GPL-3.0 (source files under MPL-2.0)
+  github.com/touchHLE/touchHLE
+
+Source code of Song Summoner Revival:
+  github.com/JohnnyCollado/Song-Summoner-Revival
+
+
+Button icons: Zacksly
+---------------------
+
+Button Icons and Controls by Zacksly (CC BY 3.0 Licensed | zacksly.itch.io)
+
+  Xbox Series, PS5 and Switch 2 "Button Icons and Controls" packs,
+  unmodified. License: http://creativecommons.org/licenses/by/3.0/
+  Details: res/controller_glyphs/CREDITS.txt in the source code.
+
+
+Gear icon: Material Icons
+-------------------------
+
+Gear icon: "Settings" from Material Icons by Google (Apache License 2.0)
+
+  The Android build's Setup button. License:
+  https://www.apache.org/licenses/LICENSE-2.0
+
+
+Song Summoner and Square Enix
+-----------------------------
+
+Song Summoner: The Unsung Heroes Encore © 2009 SQUARE ENIX CO., LTD. All
+rights reserved. The game, its name, characters, story, music and artwork
+are the property of Square Enix. SQUARE ENIX is a registered trademark of
+Square Enix Holdings Co., Ltd.
+
+Song Summoner Revival is an unofficial, non-commercial fan project. It is
+not made, approved or endorsed by Square Enix. It contains no part of the
+game: you must supply your own legally obtained copy.
+
+If you enjoy Song Summoner, please support Square Enix by buying their
+games through their official store and channels.
+
+
+Support the developer
+---------------------
+
+Song Summoner Revival is free, and always will be. It's made by one person
+in their spare time. If it brings you some joy and you'd like to support my
+work as a solo developer, a tip is always appreciated but never required.
+Thank you for playing!
+
+  Buy me a Taco: buymeacoffee.com/johnnycolli

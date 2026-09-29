@@ -81,6 +81,10 @@ pub struct Options {
     /// Ask for the music folder again even if one was chosen before.
     pub choose_music_folder: bool,
     pub confirm_button: ConfirmButton,
+    /// Song Summoner's controller: show its debug overlays (outlines on
+    /// every focused item, touchHLE's tile diamond) instead of the play
+    /// look, which leans on the game's own highlights.
+    pub controller_debug: bool,
 }
 
 impl Default for Options {
@@ -118,6 +122,7 @@ impl Default for Options {
             music_library: false,
             choose_music_folder: false,
             confirm_button: ConfirmButton::South,
+            controller_debug: false,
         }
     }
 }
@@ -252,6 +257,8 @@ impl Options {
             self.gdb_listen_addrs = Some(addrs);
         } else if let Some(value) = arg.strip_prefix("--preferred-languages=") {
             self.preferred_languages = Some(value.split(',').map(ToOwned::to_owned).collect());
+        } else if arg == "--controller-debug" {
+            self.controller_debug = true;
         } else if arg == "--music-library" {
             self.music_library = true;
         } else if arg == "--choose-music-folder" {
@@ -387,5 +394,13 @@ mod tests {
         assert_eq!(options.confirm_button, ConfirmButton::South);
         assert!(options.parse_argument("--confirm-button=A").is_err());
         assert_eq!(options.confirm_button, ConfirmButton::South);
+    }
+
+    #[test]
+    fn controller_debug_is_off_unless_asked_for() {
+        assert!(!Options::default().controller_debug);
+        let mut options = Options::default();
+        assert_eq!(options.parse_argument("--controller-debug"), Ok(true));
+        assert!(options.controller_debug);
     }
 }

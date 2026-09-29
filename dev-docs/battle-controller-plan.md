@@ -606,3 +606,44 @@ MENU and the deploy menu, one press closes the terms.
   3 items round (`battle::ring_steps`, by item order). The ring doesn't
   turn while a finger is down, so the tapped item stays put under it.
   Confirm and back still wait for the ring to stop.
+- **2026-09-28, user's choice: the game's own cursor.** touchHLE's
+  diamond is drawn over the whole frame, so it covered the units. Now the
+  held finger's tile shows the game's cursor (drawn under the units)
+  instead: the diamond is hidden once the finger is a hold on the cursor's
+  tile (`Finger::held`, 8 frames) and only shows while the finger is up.
+  **Unit select moved onto the held finger too** (`unit_select` uses
+  `battle::follow` with `UNIT_SELECT_HOLD` and `TAP_AREA`): the finger rests
+  on the cursor's tile (the status panel previews the unit under it), confirm
+  lets go (acting, as before on release), and L/R, Start and zoom first let
+  go on a tile with no unit. The old confirm-held preview (`keep_down`) is now
+  only the deploy map view's. The bottom rows, too low to hold, keep the
+  diamond and a tap.
+- **2026-09-28, touch broke:** the always-held finger (unit, move and
+  attack select, the skill panel, placing) kept pressing while the player
+  used touch, and dropping it without a finger-up left the game counting it
+  (`SysTouch_Began_F1` adds to the count; only a finger-up or
+  `SysTouch_Clear` resets it), so a real touch became a second finger (a
+  pinch). Now those screens only hold a finger while the controller is in
+  use (`pad_mode`; a touch hands over, the next button press takes back),
+  and every dropped finger the game had down is cleared with the game's own
+  `SysTouch_Clear` (`drop_finger`), before the real touch reaches it.
+- **2026-09-28, a map script's message in unit end:** "You found a buried
+  treasure chest!" showed in phase 28, which drops presses, so confirm did
+  nothing. A running script (`_tactics_script_flag`, 0xc4a9c:
+  `Tactics_Main` runs `TacticsFlow_ScriptLoop` instead of the phase) or a
+  shown "tap to continue" mark (`SysMessageKeyMark`: `SysAnim` id at
+  `_mesmanage` 0xcdca8 `+0x0`, enabled `+0x4`) now makes any phase
+  tap-anywhere (`battle::owner_now`), and drops a held finger cleanly.
+- **2026-09-28, the play look:** outlines are debug-only now
+  (`--controller-debug`). Without it each screen says what its outline
+  becomes (`Clean`, applied by `play_look` in `show_focus`): hidden where
+  the game shows the selection itself (the title drum's band, the centred
+  card, the game's tile cursor under a held finger), or a copy of the
+  game's list highlight where it has no resting selected look (button
+  menus, dialogs, Help, Options, the card list's icons, the sort panel,
+  the quantity dial). Select-then-press screens (towns, the location menu,
+  the Pearl split) get their first item selected by one tap when they open
+  with the controller in use (`preselect_tap`), so the game shows its own
+  highlight and description. touchHLE's tile diamond only shows on tiles
+  a finger can't be held on. The mockups: the "Controller UI clean-up
+  mockups" canvas.

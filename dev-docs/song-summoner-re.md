@@ -441,9 +441,91 @@ region 6.
   row (x ≤ px < x + width, y ≤ py < y + 40) that's enabled returns its
   index, a disabled one −3, no row −2 (cancel). It tests every row, **even
   ones scrolled out of the window**, so only tap rows on screen.
+- The row highlight (read 2026-09-28): `SysMenu_Open` opens three
+  untextured sprites, `+0xd24` (0x80202020), **`+0xd28` the highlight
+  (ARGB 0x40f0f0f0, near-white at 25%)** and `+0xd2c` (0x80f0f0f0, a line
+  as wide as the menu); each row also gets a 1-point 0x40ffffff line.
+  `SysMenu_Disp_Cursor(id, shown)` puts the highlight at the menu's x
+  (`+0xd08`), one point above the cursor row (`+2`), and shows or hides
+  it; there's no `Set_Cursor`. `Check2` calls it for a still finger on an
+  enabled row (the row becomes `+2`) and hides it on a flick.
+  `SysTouch_Moved_F1` sets the flick flag on any move. The controller
+  draws a copy of the highlight (`FocusShape::Highlight`) on its focused
+  row, and hides it while the game's own shows.
 - `menumain`: position += speed, speed × 0.9 each frame, clamped to the
-  list; below 0.08 the speed stops and the position rounds to a whole row.
-  So one move of 4.8 points scrolls about one row.
+  list. Below 0.08 (worked through against a log, 2026-09-28) the
+  snap *adds* min(0.005 / d, d) toward the nearest row (d its distance)
+  to the speed each frame, and only stops when the position crosses a
+  whole row while under 0.08. A glide that ends far from a row speeds
+  back up past 0.08 and overshoots: 4.8 points ends a row the **wrong**
+  way after 47 frames. Drags of 2.7-3.8 points land one row on; the
+  controller uses 3.5 (10 frames). Touch hits the same crawl when a flick
+  stops near half a row.
+- `SysMenu_Check` (the shop's older list) computes the same speed,
+  (prev.y - y) / 24, but a finger down on an enabled row makes it the
+  cursor and calls `SysTouch_Clear`. Its caller runs `menumain` itself
+  through `SysMenu_Update`; the `Menumenumain` task only closes the work.
+
+### The shop's quantity dial (older `SysDrum`) (decoded 2026-09-28)
+
+- `ShopFlow_BuyMenu` opens two `SysDrum`s (task main `drummenumain`),
+  ids at shop work `+0x10c` (tens, at (306, 40)) and `+0x110` (ones, at
+  (375, 40)), each 80x170, ten items each whose value (`+0x38`) is the
+  digit. The amount is tens x 10 + ones (0x13ac4); a `SysDialog` below
+  has Forget it (left) and Confirm (right), and Confirm is made
+  unselectable past 99 held or what the Luna covers.
+- Drum work: byte `+2` cursor, `+4` count, items 0x2c bytes (`+0x18`
+  enabled, `+0x38` value), `+0x1610/+0x1612` position, `+0x1614/+0x1616`
+  size, `+0x161c` position (float, in items, wrapping), `+0x1620` speed,
+  `+0x1628` the frame's nudge. `SysDrum_CheckCursordisp`: speed 0 and
+  nudge under 1e-5.
+- `SysDrum_Check`: a finger down in the rect zeroes the speed; a move in
+  it sets the speed to (prev.y - y) / 24. A finger-up in the rect with no
+  move clears the touch and returns the digit, which the Buy flow takes
+  as "pick": it clamps the amount and `SysDrum_Set_Cursor`s both drums
+  (which zeroes their speed). After a move the flick branch runs
+  instead, so a flick never picks.
+- `drummenumain`: position += speed, speed x 0.8. Below 0.1 a nudge
+  toward the nearest digit (2a(a + 0.5) / 3, a the signed distance past
+  the half) joins the speed; when they pull opposite ways the speed is
+  quartered, and under 0.02 within 0.05 of a digit it stops there.
+  The controller flicks 6 points per digit (8 frames).
+
+### The shop's password spot and keyboard (decoded 2026-09-28)
+
+- `Shop_Main`'s flow (`+0`, `__switchu8` at 0x14274): 3 the top menu
+  (`ShopFlow_MenuSelect`), 4 password input, 5 its tutorial (the first
+  time), 6 buy, 7 sell, 8/9 leaving.
+- The top menu (flow 3, sub-state `+4` = 1) is a `SysButtonMenu` at
+  (320, 200), three buttons. Before `SysButtonMenu_Check`, a non-flick
+  finger-up at x 40-192, y ≥ 108 (over the shopkeeper,
+  `ui_bust_shop.png` at (-48, 64), 256×256) closes the menu and opens
+  the password entry. No button marks it. The controller's Info button
+  (north) taps it, and while the pad or keyboard is in use touchHLE draws
+  a "Password" pill with that button's icon in the bottom-left corner
+  (`setup_view::render_hud`).
+- Password input (flow 4) shows messages (tap anywhere), then opens the
+  `Keyboard_Main` task and waits for it to end.
+- `Keyboard_Main` (0x4d1d0): state `+0` (switch16 at 0x4d1e8), 1 takes
+  touches. `getkeybord(point)` (0x4d0e8) finds the key in `keyrect`
+  (0x6ea48): 10-byte entries, `short` x, y, w, h and the key byte,
+  ending at key 0, hit where x ≤ px < x + w and y ≤ py − 160 < y + h. Rows
+  at screen y 164, 204, 244 (39×32 keys, 47 apart from x 9) and 284 (Z to
+  M from x 80), plus `r` (9, 285, 51×30), `b` (432, 244) and `e`
+  (419, 285, 51×30). I and O are stored as `1` and `0`.
+- While a finger is down the key under it is kept at `+0x14`; on the
+  finger-up that key acts: `e` checks the password (state 2), `b`
+  deletes the last character (count byte `+0x30c`, text from `+0x18`),
+  `r` opens a `SysDialog` (state 9, to stop), anything else is typed
+  (at most 35). Results and errors are `SysDialog` messages.
+- Controller (`keyboard_command`): the D-pad moves over the keys by
+  position, confirm types the focused key, back is Backspace (or, with
+  nothing typed, the `r` key). With Setup > Game > Shop password set to
+  the device keyboard (the default on desktop), a real keyboard types too
+  (`typed_key`, before the key mapping): letters, digits, Backspace, and
+  Return for Enter; I and O type 1 and 0 as the game's keys do. On
+  Android that setting shows the on-screen keyboard (SDL text input)
+  while the game's keyboard is up, and its text is typed the same way.
 
 ### Edit Troopers (`Teammake`) sort panel and the status panel
 
@@ -1056,6 +1138,11 @@ not read.)
   only `SysTouch_Get_EndedState`, no position: tap anywhere.
 - **The attack animation** (`TacticsAttack2`, damage, effects), unit end,
   phase start and results read no touch at all.
+  But a script can run in any of them (`_tactics_script_flag`, e.g. a map
+  script's "You found a buried treasure chest!" in unit end, seen
+  2026-09-28), and its text takes a tap; so can any message showing the
+  "tap to continue" mark (`_mesmanage`: `+0x0` its `SysAnim`, `+0x4`
+  enabled).
 Controller: confirm taps the centre. **While a tutorial is active the battle
 input must stand down**: no held virtual finger (its lift would be what
 advances the tutorial, and the phase underneath isn't running), and no
@@ -1201,6 +1288,10 @@ Steps:
    controller's cursor ignores. State 3 (another team's unit's status,
    read from 0x39600, to confirm): confirm / back tap (320, 160) to close,
    north (80, 160) to flip.
+   **Changed 2026-09-28 (not yet tested):** a virtual finger now rests on
+   the controller's tile the whole time, so the game's own cursor (under the
+   units) and status panel follow it; confirm is the release. See
+   `battle-controller-plan.md` §7.
 3. Command ring. **Written 2026-09-27, not yet tested in play**
    (`ring_top`, `battle::ring_command`), with its status and skill panel
    (`skill_panel`: a held finger on the row, confirm lets go, back slides
@@ -1226,6 +1317,82 @@ Steps:
    tutorials keep the centre tap.
    Victory terms: confirm closes them in state 4; earlier presses are
    dropped.
+
+### Results: splitting Pitch Pearls (read from code 2026-09-28)
+
+- Scene `Result_Main` (0x47fb8), work through the task table: `+0x0` the
+  flow (`ResultFlow_Change_FlowNumber` also zeroes `+0x4`; `Result_Main`'s
+  `___switchu8` at 0x47fc4): 12 `ResultFlow_DivideQuestion` (the "Use the
+  Pitch Pearls earned on the Trooper you deployed?" `SysDialog`), **13
+  `ResultFlow_DivideSelect`** (0x46ba4), 14 `FighterRankUp`, 17
+  `EndQuestion`.
+- `DivideSelect`'s sub-state `+0x4` (`___switch16` at 0x46bbc): 0 set up,
+  **1 takes touches**, 2 a message (any finger-up closes it), 3 the
+  "Rank up this Trooper?" `SysDialog` (`+0x44`), 4 EXIT's animation, 5 the
+  end dialog. `+0xc` the selected trooper, `+0x1c` how many.
+- On a finger-up at y 228-300, slot i is x 156 + 64i to 204 + 64i (i < 5):
+  slots below `+0x1c` are troopers, slot 4 is EXIT. Another trooper: SE 2,
+  it's selected (its status shows). The selected one: SE 9, and if its
+  rank (`_savedat + 0x3264` per fighter) is at most 2 and the pearls
+  (`_savedat + 0x68`) cover `getneedpitchpearls`, the rank-up dialog;
+  otherwise SE 1 and a message. EXIT (never the selected slot): SE 9,
+  leave (sub-state 4).
+- Controller (`game_input.rs`, `result_divide`): a two-tap `Scene` group
+  over the troopers (left/right select, confirm on the selected one asks
+  to rank up); back taps EXIT, which the D-pad doesn't reach since one tap
+  on it leaves.
+
+### Controller coverage scan (2026-09-28)
+
+Every function that reads touch (callers of `SysTouch_Get_EndedState`,
+`_PosData`, `_BeganState`, `_TouchState`, `SysPrim_Touch_DrawRect`,
+`SysTouch_Check_InRect`), sorted by what the controller does there.
+
+**Handled:** `SysButtonMenu`, `SysDialog`, `SysDrum2`, `SysMenu_Check2`
+lists, the card list, Options, Help, the Hip-O-Drome, Teammake, towns, the
+world map and its location menu, cutscene and Listening Point SKIP, every
+battle phase module, the Results pearl split.
+
+**Only wait for a finger-up anywhere** (the controller's centre tap
+covers them): `Ending_Main`, `Colosseum_Main`, `Shop_Main`,
+`ShopFlow_Exit1st`, `ShopFlow_PasswordInput`/`_PasswordTutorial` (around
+the keyboard), `StatusSlot_Check`/`2`, `ScriptTouch_End`, `odemomain`,
+`TacticsHarmony_Main`, `TacticsSilentBox_Main`, `TacticsContestWin`/`Lose`,
+`TacticsMapMenu_Loop_CtrlResume`, `TacticsMessage_Main` (between fights,
+phase 34; see below), `TacticsMapFind_Loop_*` (the buried
+treasure; run from `RunScript`, so the script flag is set), and the Result
+flows (`TacticsScore`, `TacticsGetItem`, `SortieLimit`, `FighterLost`,
+`Get_EnemyDrop`, `AddDropNum`, `DivideQuestion`, `FighterRankUp`,
+`EndQuestion`, `FreeMapTutotrial`).
+
+**Missed: look at where the finger is:**
+- The shop: done since (the lists, the quantity dial, the password spot
+  and keyboard; see above).
+- `Catalog2_Main` (scene 8, the catalog): sprite hit tests, positions and
+  flicks.
+- `PalaceFlow_Recommend` (the Hip-O-Drome's Pick of the Pops): a sprite
+  hit test (the song's artwork) next to a "tap to continue" message;
+  check the centre tap doesn't land on the artwork.
+- `ColosseumFlow_TetsujinGet`: positions and flicks around a talk message
+  and a card; probably tap to continue, to check.
+- `TitleFlow_Product`: the "other games" line-up; its icons open App Store
+  URLs, which would background the app (touchHLE quits). The controller
+  must only tap its back icon (`tc_icon`).
+
+**`TacticsMessage_Main`** (0x38820, work `_tacticsmessage_work` 0x14d7c0;
+decoded 2026-09-28). `TacticsMessage_Start(mode, message, y)` stores the
+mode at `+0x8`. Mode 1 is a two-choice message: a finger-up at x 80-240,
+y 200-240 (sprite `+0x18`) plays SE 9 and returns 1; x 240-400 (sprite
+`+0x1c`) SE 3 and 2; any other still finger-up also SE 3 and 2, a flick
+nothing. Any other mode: a finger-up anywhere, SE 9, returns 1. Its only
+caller, `TacticsBattlingNext_Main` (between fights, phase 34, sub-phase
+0x64 start, 0x65 run, 0x66 end), passes mode 0 and treats any result as
+"go on": so the centre tap works, and the two-choice mode is unused.
+
+**Debug scenes, not reachable in play:** `Test1`-`Test7`, `AnimTest`,
+`AnimTest2`, `iPodTest`, `SoundTest`, `TouchTest`, `MessageTest`,
+`ScriptTest`, `StageSelect_Main` (adds bench units, clears the save),
+`TouchDebug_Main` (always running, draws nothing in play).
 
 ### Milestones
 

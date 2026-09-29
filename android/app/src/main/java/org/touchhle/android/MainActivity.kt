@@ -10,8 +10,13 @@ package org.touchhle.android
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.system.Os
 import android.util.Log
+import android.view.MotionEvent
+import android.view.ViewGroup
+import android.widget.ImageButton
 import org.libsdl.app.SDLActivity
 import java.io.File
 
@@ -31,10 +36,46 @@ class MainActivity : SDLActivity() {
         // before super so the Rust side picks it up on first lookup.
         private const val ENV_USER_DATA_BASE_PATH =
             "TOUCHHLE_USER_DATA_BASE_PATH"
+
+        // The running activity, for requestSetup (called from the engine's
+        // thread over JNI).
+        @Volatile
+        private var instance: MainActivity? = null
+
+        // The gear button was tapped: the engine opens Setup on its next
+        // poll. Implemented in src/window.rs.
+        @JvmStatic
+        external fun nativeOpenSetupMenu()
+
+        // Called by the engine (src/frameworks/song_summoner/setup.rs)
+        // when the Setup menu needs a system picker or another app: hand
+        // the job to SetupActivity in a fresh process. The engine quits
+        // right after this returns, so startActivity is called here, on
+        // its thread, rather than posted.
+        @JvmStatic
+        fun requestSetup(action: String) {
+            val activity = instance ?: return
+            Log.i(TAG, "setup: restarting into SetupActivity for $action")
+            val intent = Intent(activity, RestartActivity::class.java)
+                .putExtra(RestartActivity.EXTRA_ACTION, action)
+                .putExtra(RestartActivity.EXTRA_PID, android.os.Process.myPid())
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            activity.startActivity(intent)
+        }
     }
 
-    // Resolved public user-data folder for this flavor.
-    private val userDataDir = SetupActivity.resolveUserDataDir()
+    private var gear: ImageButton? = null
+    private val dimHandler = Handler(Looper.getMainLooper())
+    // The setting is read when it's time to fade, not once at the start,
+    // so turning it off in the Setup menu takes effect right away.
+    private val dimGear = Runnable {
+        if (SetupPill.autoDimFor(userDataDir)) {
+            gear?.animate()?.alpha(SetupPill.DIM_ALPHA)?.setDuration(400)
+        }
+    }
+
+    // The user-data folder for this flavor (see SetupActivity.resolveUserDataDir).
+    private val userDataDir by lazy { SetupActivity.resolveUserDataDir(this) }
 
     // Absolute path to the wrapper IPA on public storage. Resolved once in
     // onCreate (before super, so getArguments can return it as argv[1] when
@@ -75,7 +116,72 @@ class MainActivity : SDLActivity() {
         // The engine opens the user's songs through this (over JNI) once it
         // is running.
         MusicFiles.init(this)
+        // ...and copies changed saves to the save folder through this.
+        SaveFolder.init(this, userDataDir)
         super.onCreate(savedInstanceState)
+        instance = this
+        if (BuildConfig.WRAPPER_AUTO_LAUNCH) {
+            addSetupGear()
+        }
+    }
+
+    override fun onDestroy() {
+        if (instance === this) {
+            instance = null
+        }
+        dimHandler.removeCallbacks(dimGear)
+        super.onDestroy()
+    }
+
+    // The gear that opens Song Summoner's Setup menu, in the black bar
+    // beside the game (see SetupPill). Always there, so the Android build
+    // needs no "press F2" reminder.
+    private fun addSetupGear() {
+        val layout = SDLActivity.mLayout ?: return
+        val density = resources.displayMetrics.density
+        val size = (44 * density).toInt()
+        val margin = (12 * density).toInt()
+        val button = ImageButton(this)
+        button.setImageResource(R.drawable.ic_setup_gear)
+        button.setBackgroundResource(R.drawable.setup_gear_bg)
+        button.contentDescription = "Setup"
+        button.scaleType = android.widget.ImageView.ScaleType.CENTER_INSIDE
+        val pad = (10 * density).toInt()
+        button.setPadding(pad, pad, pad, pad)
+        // Never take focus: SDL would see the game lose it, and touchHLE
+        // quits then.
+        button.isFocusable = false
+        button.isFocusableInTouchMode = false
+        button.setOnClickListener {
+            showGear()
+            nativeOpenSetupMenu()
+        }
+        layout.addView(button, ViewGroup.LayoutParams(size, size))
+        gear = button
+        layout.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+            val (x, y) = SetupPill.position(v.width, v.height, size, margin)
+            button.x = x.toFloat()
+            button.y = y.toFloat()
+            button.bringToFront()
+        }
+        showGear()
+    }
+
+    // Full strength now, fading again later if the player wants that.
+    private fun showGear() {
+        val button = gear ?: return
+        dimHandler.removeCallbacks(dimGear)
+        button.animate().cancel()
+        button.alpha = 1f
+        dimHandler.postDelayed(dimGear, SetupPill.DIM_AFTER_MS)
+    }
+
+    // Any touch brings a faded gear back. The touch still goes to the game.
+    override fun dispatchTouchEvent(event: MotionEvent?): Boolean {
+        if (event?.actionMasked == MotionEvent.ACTION_DOWN && gear != null) {
+            showGear()
+        }
+        return super.dispatchTouchEvent(event)
     }
 
     // In wrapper-flavor builds (BuildConfig.WRAPPER_AUTO_LAUNCH = true) with

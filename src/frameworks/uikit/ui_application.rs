@@ -447,6 +447,9 @@ pub(super) fn exit(env: &mut Environment) {
         let _: () = msg![env; pool drain];
     };
 
+    // Song Summoner's save folder gets the saves the app just wrote.
+    crate::frameworks::song_summoner::before_exit(env);
+
     std::process::exit(0);
 }
 

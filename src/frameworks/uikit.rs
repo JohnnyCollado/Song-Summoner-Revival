@@ -103,6 +103,13 @@ pub struct State {
     ui_responder: ui_responder::State,
 }
 
+/// Quit the app the way touchHLE always does (telling it first, so it can
+/// save), for restarts asked for by touchHLE itself (Song Summoner's Setup
+/// menu). Doesn't return.
+pub(crate) fn exit_app(env: &mut Environment) {
+    ui_application::exit(env);
+}
+
 /// For use by `NSRunLoop`: handles any events that have queued up.
 ///
 /// Returns the next time this function must be called, if any, e.g. the next
@@ -118,13 +125,26 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 echo!("User requested quit, exiting.");
                 ui_application::exit(env);
             }
-            Event::TouchesDown(..) => {
-                // Touch takes over from the controller in Song Summoner's
-                // menus (hides its focus). Nothing happens for other apps.
-                crate::frameworks::song_summoner::touch_used(env);
+            Event::TouchesDown(..) | Event::TouchesMove(..) | Event::TouchesUp(..) => {
+                // Song Summoner's Setup menu, while open, takes every touch.
+                if crate::frameworks::song_summoner::handle_touch(env, &event) {
+                    continue;
+                }
+                if matches!(event, Event::TouchesDown(..)) {
+                    // Touch takes over from the controller in Song
+                    // Summoner's menus (hides its focus). Nothing happens
+                    // for other apps.
+                    crate::frameworks::song_summoner::touch_used(env);
+                }
                 ui_touch::handle_event(env, event)
             }
-            Event::TouchesMove(..) | Event::TouchesUp(..) => ui_touch::handle_event(env, event),
+            Event::Key { key, pressed } => {
+                // Only Song Summoner has keyboard controls.
+                crate::frameworks::song_summoner::handle_key(env, &key, pressed);
+            }
+            Event::OpenSetupMenu => {
+                crate::frameworks::song_summoner::open_setup_menu(env);
+            }
             Event::AppWillResignActive => {
                 // Getting this event means touchHLE is becoming inactive, e.g.
                 // due to switching apps. The obvious way to handle this would
@@ -171,6 +191,11 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                 );
             }
             Event::TextInput(text_event) => {
+                // Song Summoner's password keyboard, typed on Android's
+                // on-screen keyboard.
+                if crate::frameworks::song_summoner::handle_text(env, &text_event) {
+                    continue;
+                }
                 let responder = env.framework_state.uikit.ui_responder.first_responder;
                 let class = msg![env; responder class];
                 let ui_text_field_class = env.objc.get_known_class("UITextField", &mut env.mem);

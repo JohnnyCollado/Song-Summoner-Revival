@@ -12,6 +12,8 @@
 mod eagl;
 pub(crate) mod gles_guest;
 
+pub use eagl::present_again;
+
 use touchHLE_gl_bindings::gles11::types::GLenum;
 
 use crate::mem::ConstPtr;

@@ -8,6 +8,16 @@ that game specifically; the upstream emulator already runs other titles.
 You supply your own copy of the game's IPA. It is never included in this
 repository, the APK or the Windows build, and neither is any of its art.
 
+**New in v0.2.3:** play the whole game with a controller, an easier-to-see
+cursor, the Setup menu on both platforms, and saves that survive an
+uninstall on Android. See the
+[release notes](dev-docs/releases/v0.2.3.md).
+
+Free, and always will be. If you'd like to support a solo developer
+(never required):
+
+[![Buy me a Taco](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20Taco&emoji=%F0%9F%8C%AE&slug=johnnycolli&button_colour=BD5FFF&font_colour=ffffff&font_family=Cookie&outline_colour=000000&coffee_colour=FFDD00)](https://www.buymeacoffee.com/johnnycolli)
+
 Design and background:
 
 - [`dev-docs/song-summoner-media-plan.md`](dev-docs/song-summoner-media-plan.md):
@@ -24,20 +34,78 @@ aac, wav or caf** (FLAC and Ogg can't be played yet, so they're skipped).
 Tags give each song its title, artist and album; embedded cover art is
 shown too. Each subfolder also appears as a playlist.
 
-**Windows.** The first time you start the game, a *Select folder* dialog
-asks where your music is. The library is read in the background while the
-game boots. Later starts only re-read files that changed. To pick another
-folder, start with `--choose-music-folder` or delete `library\source.txt`
-from the game folder.
+Add your music folders in the **Music** tab of the Setup menu (below),
+which opens by itself on the first launch. The library is read in the
+background (Windows) or on the next start (Android). Later starts only
+re-read files that changed.
 
-**Android.** After the storage permission and the IPA, Android's own folder
-picker asks for your music folder (for example `Music/`), then a progress
-screen reads the library once. To pick another folder, long-press the app
-icon and choose **Change music folder** (close the game first).
+**Android first launch.** No storage permission is asked. You pick your
+copy of the game (.ipa), then a **save folder** (for example
+`Documents/SongSummoner`), where your saves, settings, backups and bug
+reports are kept so they survive an uninstall. If you played the first
+release, pick your old `SongSummoner` folder and your saves come along.
+Then the game starts in the Setup menu. To start over with a single music
+folder, long-press the app icon and choose **Change music folder** (close
+the game first).
 
 Everything the scan produces lives in `library/` inside the game's data
-folder (next to `touchHLE.exe`, or `/sdcard/SongSummoner/` on Android):
-`index.tsv`, `art/`, `playcounts.tsv` and `source.txt`.
+folder (next to `touchHLE.exe`, or the app's own folder on Android):
+`index.tsv`, `art/`, `playcounts.tsv` and `source.txt` (one music folder
+per line).
+
+## The Setup menu
+
+The game opens a **Setup** menu by itself on its first launch. After that:
+
+- **Keyboard:** press **F2** (on Android too, with a USB or Bluetooth
+  keyboard).
+- **Android:** tap the **gear** in the black bar beside the game.
+- **Controller (both):** hold **Select**, then press **Start**.
+
+The game is paused while it's open. L1/R1 switch tabs, Confirm steps into a
+tab, Back steps out, and Back on the tab list resumes the game. Touch and
+mouse work too: one tap chooses, and a drag scrolls long tabs.
+
+| Tab | What's there |
+|---|---|
+| Game | Change the game file (.ipa), button icon style, show FPS, fullscreen (Windows), fading gear (Android), cursor look and colour, how to type the shop password |
+| Music | Your music folders (add, remove), rescan, scroll speed |
+| Controller | Move any action to another button; the left stick always works like the D-pad; stick dead zone |
+| Keyboard | Two keys per action, all remappable; F2, F11 and F12 are reserved |
+| Data & help | Open the data folder, make a bug-report file, back up and restore saves, button tester |
+| Credits | touchHLE, the icon artists, the Square Enix notice, and the tip jar |
+
+Changing the game file or music folders restarts the game after asking
+(anything since your last in-game save is lost). The settings are kept in
+`song_summoner_settings.txt` in the data folder.
+
+**Where your saves are.** On Windows, everything lives next to
+`touchHLE.exe`. On Android the game runs from its own folder (shown as
+"Song Summoner" in the Files app) and keeps a copy in your save folder, with
+the same layout; Setup > Data & help > Open data folder shows it. Saves are in
+`touchHLE_sandbox/com.square-enix.SongSummonerEncore/` (`Documents/` and
+`Library/Preferences/`), the log is `touchHLE_log.txt`, bug reports go to
+`bug-reports/` and save backups to `backups/`. A bug report never contains
+the game or your saves.
+
+## Playing with a controller
+
+Every menu, dialog and list, the battle map, the world map and the shop work
+with a controller. The D-pad moves between buttons by where they are on
+screen. In a Yes/No dialog, left is always **No** and right is always
+**Yes**; lists wrap from the bottom back to the top.
+
+- **Battle:** move the tile cursor with the D-pad, Confirm to choose, L1/R1
+  to step through your units, L2/R2 to zoom, Start for the battle menu.
+- **Cutscenes:** Start skips.
+- **Shop password:** use the game's keyboard with the D-pad, or type it on
+  a keyboard or your phone's own keyboard (Setup > Game > Shop password).
+- **Cursor:** Setup > Game > Cursor makes it Outlined or Bold, in gold,
+  white, yellow or sky blue. Every colour sits on a dark edge, so it stands
+  out without telling colours apart.
+
+`--confirm-button=south|east` picks which face button confirms on the first
+launch; after that, change buttons in Setup > Controller.
 
 ## Picking a song
 
@@ -82,7 +150,41 @@ Building: see [`dev-docs/building.md`](dev-docs/building.md).
 
 ## Credits
 
+Built on [touchHLE](https://github.com/touchHLE/touchHLE): touchHLE ©
+2023–2026 touchHLE project contributors, GPL-3.0 (source files under
+MPL-2.0).
+
 Controller button icons: "Button Icons and Controls" by
 [Zacksly](https://zacksly.itch.io), licensed under
 [CC BY 3.0](http://creativecommons.org/licenses/by/3.0/). The files in
 `res/controller_glyphs/` are unmodified; see `CREDITS.txt` there.
+
+Gear icon: "Settings" from Material Icons by Google, Apache License 2.0.
+
+The full text is in [`CREDITS.txt`](CREDITS.txt), which also ships with the
+Windows build and the APK, and in the Setup menu's Credits tab.
+
+## Support the developer
+
+Song Summoner Revival is free, and always will be. It's made by one person
+in their spare time. If it brings you some joy and you'd like to support my
+work as a solo developer, a tip is always appreciated but never required.
+Thank you for playing!
+
+[![Buy me a Taco](https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20Taco&emoji=%F0%9F%8C%AE&slug=johnnycolli&button_colour=BD5FFF&font_colour=ffffff&font_family=Cookie&outline_colour=000000&coffee_colour=FFDD00)](https://www.buymeacoffee.com/johnnycolli)
+
+buymeacoffee.com/johnnycolli (also in the Setup menu's Credits tab).
+
+## Legal
+
+Song Summoner: The Unsung Heroes Encore © 2009 SQUARE ENIX CO., LTD. All
+rights reserved. The game, its name, characters, story, music and artwork
+are the property of Square Enix. SQUARE ENIX is a registered trademark of
+Square Enix Holdings Co., Ltd.
+
+Song Summoner Revival is an unofficial, non-commercial fan project. It is
+not made, approved or endorsed by Square Enix. It contains no part of the
+game: you must supply your own legally obtained copy.
+
+If you enjoy Song Summoner, please support Square Enix by buying their
+games through their official store and channels.

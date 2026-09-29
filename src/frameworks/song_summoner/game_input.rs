@@ -65,14 +65,17 @@
 //! With no menu open, confirm taps the middle of the screen, which is what
 //! "press start" and "tap to continue" text want.
 //!
-//! - Battle's unit select (the map with the status panel): the D-pad moves
-//!   a tile cursor along the grid's axes (a gold diamond drawn by touchHLE
-//!   inside the tile's edges), panning the map with a flick when it leaves
-//!   the area a finger can reach; confirm holds a finger on its tile (the
-//!   game picks a held finger's unit by tile, a tap's by sprite), the
-//!   shoulders tap the curved arrows (previous/next unit) and
-//!   Start taps MENU. An enemy's status (after tapping one): confirm or back
-//!   close it, north flips its page.
+//! - Battle's unit select (the map with the status panel): a virtual finger
+//!   rests on the cursor's tile, so the game draws its own cursor there
+//!   (under the units) and its status panel shows the unit under it. The
+//!   D-pad slides it along the grid's axes, panning the map with a flick
+//!   when a tile is out of reach; confirm lets go, which acts on the tile
+//!   (the game picks a held finger's unit by tile, a tap's by sprite); the
+//!   shoulders tap the curved arrows (previous/next unit) and Start taps
+//!   MENU, after letting go where nothing happens. Where the finger can't
+//!   reach (the bottom rows), touchHLE draws a gold diamond instead. An
+//!   enemy's status (after picking one): confirm or back close it, north
+//!   flips its page.
 //! - The rest of battle, one handler per phase (`battle::phase_owner`): the
 //!   command ring (left/right tap the neighbouring item, confirm the front
 //!   one, back outside), its skill panel and status; move select, attack
@@ -89,13 +92,12 @@
 //! ([DRAW_TILE_GRID], off).
 
 use super::battle::{self, Camera, Grid, Tile};
-use super::pad::{self, Role};
+use super::pad::Role;
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::gles::present::{FocusMarker, FocusShape};
 use crate::mem::{ConstPtr, MutPtr, Ptr};
 use crate::objc::{id, msg, nil, Override, SEL};
-use crate::window::PadButton;
 use crate::Environment;
 use std::collections::VecDeque;
 
@@ -107,6 +109,41 @@ const HOLD_FRAMES: u32 = 2;
 const MAX_QUEUED_TAPS: usize = 2;
 /// The same for D-pad presses and the like.
 const MAX_QUEUED_COMMANDS: usize = 4;
+/// Frames the play look hides a menu's or dialog's highlight after the
+/// controller presses one of its buttons: the game animates the pressed
+/// button (5 frames), then usually closes it, and a menu under a dialog
+/// just answered showed its highlight again, on its first button, as it
+/// closed (2026-09-28). A menu that stays gets it back after this.
+const PRESS_HIDE_FRAMES: u64 = 20;
+/// Frames presses may wait with none of them used before they're dropped.
+/// A screen that ignores the D-pad (an attack playing out, a message) left
+/// them queued, and they moved the cursor once the player backed out
+/// (2026-09-28). Real waits (a camera pan, a scroll, a hold) are shorter.
+const STALE_COMMAND_FRAMES: u32 = 30;
+
+/// Counts frames the queued presses sit unused (see
+/// [STALE_COMMAND_FRAMES]).
+#[derive(Default)]
+pub struct CommandAge {
+    frames: u32,
+}
+
+impl CommandAge {
+    /// After a frame's handling, with the queue's length before and after:
+    /// whether the queue has waited too long and should be dropped.
+    pub fn stale(&mut self, before: usize, after: usize) -> bool {
+        if after == 0 || after < before {
+            self.frames = 0;
+            return false;
+        }
+        self.frames += 1;
+        if self.frames > STALE_COMMAND_FRAMES {
+            self.frames = 0;
+            return true;
+        }
+        false
+    }
+}
 
 /// Screen centre, in the game view's 480×320 landscape points.
 const CENTER: (f32, f32) = (240.0, 160.0);
@@ -201,10 +238,13 @@ const SCENE_BUTTONS: &[SceneButtons] = &[
 ];
 const SCENE_GROUPS: usize = SCENE_BUTTONS.len();
 /// How far one drag step moves the finger to scroll a `SysMenu` list by a
-/// row: `SysMenu_Check2` turns it into a speed of 4.8 / 24 = 0.2 rows per
-/// frame, which `menumain` slows by 10% a frame and snaps to a whole row
-/// below 0.08, which comes to about 1.2 rows, rounded to 1.
-const LIST_DRAG: f32 = 4.8;
+/// row: `SysMenu_Check`/`Check2` make it a speed of dy / 24 rows a frame,
+/// which `menumain` slows by 10% a frame, then below 0.08 "snaps" by
+/// pushing toward the nearest row. That push keeps adding up, so a glide
+/// that stops far from a row overshoots: 4.8 ended a row the *wrong* way
+/// after 47 frames (the shop, 2026-09-28 log). 2.7 to 3.8 all land one row
+/// on; 3.5 does it in 10 frames (see `tests::menumain_step`).
+const LIST_DRAG: f32 = 3.5;
 /// A `SysMenu` row's height (`SysMenu_Check2`'s hit test).
 const LIST_ROW_H: f32 = 40.0;
 /// A point on the card list's status panel (x <= 160 in status mode).
@@ -299,6 +339,13 @@ impl TapQueue {
     pub fn push(&mut self, gesture: Gesture) {
         if self.pending.len() < MAX_QUEUED_TAPS {
             self.pending.push_back(gesture);
+        }
+    }
+
+    /// Push a gesture if there is one.
+    pub fn extend(&mut self, gesture: Option<Gesture>) {
+        if let Some(gesture) = gesture {
+            self.push(gesture);
         }
     }
 
@@ -422,11 +469,19 @@ impl Finger {
         self.down.is_some()
     }
 
+    /// Down long enough for `Tactics_CtrlTest` to call it a hold, when the
+    /// game shows its own cursor under it.
+    pub fn held(&self) -> bool {
+        matches!(self.down, Some((_, frames)) if frames >= MIN_STILL_FRAMES)
+    }
+
     /// Drop the finger without an Ended (as [TapQueue::clear]), e.g. when
-    /// the phase it was held in has gone.
-    pub fn clear(&mut self) {
-        self.down = None;
+    /// the phase it was held in has gone. Returns whether the game had it
+    /// down: then its touch state must be cleared too (see [drop_finger]).
+    #[must_use]
+    pub fn clear(&mut self) -> bool {
         self.steps.clear();
+        self.down.take().is_some()
     }
 
     /// The call to make before the next frame, if any.
@@ -516,21 +571,56 @@ impl Menu {
     }
 }
 
-/// The next enabled button `step` away from `from`, wrapping round. Stays
-/// at `from` if none is enabled.
-pub fn next_enabled(enabled: &[bool], from: usize, step: i32) -> usize {
-    let n = enabled.len() as i32;
-    if n == 0 {
+/// The enabled button a direction moves to from `from`, by where the
+/// buttons are on screen, not their order (the game lists a dialog's
+/// buttons right to left). Left and right go to the nearest button that
+/// way and stop at the last, so a dialog's left is always its left button
+/// (the user's rule, 2026-09-28: wrapping made the focus look like it was
+/// on the other button). Up and down do the same in a column but wrap
+/// round at its ends. "That way" is within 45° of the direction, so a row
+/// has nothing above it and a column nothing beside it. Stays put when
+/// nothing is that way.
+pub fn step_toward(rects: &[(f32, f32, f32, f32)], enabled: &[bool], from: usize, role: Role) -> usize {
+    let (dx, dy) = match role {
+        Role::Up => (0.0, -1.0),
+        Role::Down => (0.0, 1.0),
+        Role::PrevSection => (-1.0, 0.0),
+        Role::NextSection => (1.0, 0.0),
+        _ => return from,
+    };
+    let Some(&here) = rects.get(from) else {
+        return from;
+    };
+    let (hx, hy) = rect_center(here);
+    // Each other enabled button: how far along the direction it is, and
+    // how far off to the side.
+    let others: Vec<(usize, f32, f32)> = rects
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != from && enabled.get(i).copied().unwrap_or(false))
+        .map(|(i, &rect)| {
+            let (x, y) = rect_center(rect);
+            let along = (x - hx) * dx + (y - hy) * dy;
+            let side = ((x - hx) * dy - (y - hy) * dx).abs();
+            (i, along, side)
+        })
+        .collect();
+    // The nearest, keeping to the line; for the wrap, the furthest the
+    // other way (the most negative `along`).
+    let best = |keep: &dyn Fn(f32, f32) -> bool| {
+        others
+            .iter()
+            .filter(|&&(_, along, side)| keep(along, side))
+            .min_by(|a, b| (a.1 + 2.0 * a.2).total_cmp(&(b.1 + 2.0 * b.2)))
+            .map(|&(i, _, _)| i)
+    };
+    if let Some(i) = best(&|along, side| along > 0.5 && side <= along) {
+        return i;
+    }
+    if dy == 0.0 {
         return from;
     }
-    let mut i = from as i32;
-    for _ in 0..n {
-        i = (i + step.signum()).rem_euclid(n);
-        if enabled[i as usize] {
-            return i as usize;
-        }
-    }
-    from
+    best(&|along, side| along < -0.5 && side <= -along).unwrap_or(from)
 }
 
 /// Which of the `open` menus (work addresses, in task table order) gets the
@@ -542,6 +632,19 @@ pub fn choose_menu(open: &[u32], known: &[u32], focused: Option<u32>) -> Option<
         .rposition(|work| !known.contains(work))
         .or_else(|| focused.and_then(|f| open.iter().position(|&w| w == f)))
         .or_else(|| open.len().checked_sub(1))
+}
+
+/// Drop dialogs with no buttons when something with buttons is open too:
+/// those are captions over a menu (the world map's "Select a map for
+/// battle." over its location list), and taking the focus they'd make
+/// confirm tap the middle of the screen instead of the menu. On their own
+/// they're messages, which confirm taps through.
+pub fn without_captions(widgets: Vec<Widget>) -> Vec<Widget> {
+    let caption = |w: &Widget| matches!(w, Widget::Dialog(d) if d.rects.is_empty());
+    if widgets.iter().all(caption) {
+        return widgets;
+    }
+    widgets.into_iter().filter(|w| !caption(w)).collect()
 }
 
 /// A `SysDialog` (song-summoner-re.md §4), from its work struct: `+0x1c`
@@ -611,6 +714,17 @@ pub fn dialog_button_art((x, y, w, h): (f32, f32, f32, f32)) -> (f32, f32, f32, 
     (x + 2.0, y + 4.0, (w - 15.0).max(1.0), (h - 20.0).max(1.0))
 }
 
+/// Where a stretched `button_001.png` frame (menu buttons, the sort
+/// panel's rows) is drawn in a button's rectangle. The 144×56 frame is
+/// opaque from 4 to 140 across and 4 to 49 down, with a soft shadow below
+/// (measured from the texture, 2026-09-28), so the play look's copy of the
+/// highlight covers the button, not its transparent edges.
+pub fn button_art((x, y, w, h): (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    let (left, top) = (w * 4.0 / 144.0, h * 4.0 / 56.0);
+    let (right, bottom) = (w * 4.0 / 144.0, h * 7.0 / 56.0);
+    (x + left, y + top, w - left - right, h - top - bottom)
+}
+
 /// Pull an outline's edges at least 4 points inside the 480×320 screen, so
 /// the marker drawn just outside them (about 3 points) is all visible.
 /// Help's rows, for one, span the whole width.
@@ -637,9 +751,9 @@ pub fn button_command(set: &ButtonSet, index: usize, role: Role) -> (usize, Opti
         return (0, (role == Role::Confirm).then_some(CENTER));
     }
     match role {
-        // Menus are columns and dialogs rows, so both axes move.
-        Role::Up | Role::PrevSection => (next_enabled(&set.enabled, index, -1), None),
-        Role::Down | Role::NextSection => (next_enabled(&set.enabled, index, 1), None),
+        Role::Up | Role::Down | Role::PrevSection | Role::NextSection => {
+            (step_toward(&set.rects, &set.enabled, index, role), None)
+        }
         // A disabled button still gets its tap: the game plays its "can't"
         // sound, which is better than silence.
         Role::Confirm => (index, Some(rect_center(set.rects[index]))),
@@ -662,21 +776,51 @@ pub fn select_command(set: &ButtonSet, index: usize, role: Role) -> (usize, Vec<
     let Some(&rect) = set.rects.get(index) else {
         return (index, Vec::new());
     };
-    let step = match role {
-        Role::Up | Role::PrevSection => -1,
-        Role::Down | Role::NextSection => 1,
+    match role {
+        Role::Up | Role::Down | Role::PrevSection | Role::NextSection => {}
         // Selected, it's pressed by one tap; else the first only selects it.
         Role::Confirm if set.selected == Some(index) => return (index, vec![rect_center(rect)]),
         Role::Confirm => return (index, vec![rect_center(rect); 2]),
         Role::Back => return (index, set.back.into_iter().collect()),
         _ => return (index, Vec::new()),
-    };
-    let next = next_enabled(&set.enabled, index, step);
-    // Never tap the selected button by moving: that would press it.
-    if set.selected == Some(next) {
+    }
+    let next = step_toward(&set.rects, &set.enabled, index, role);
+    // Never tap the selected button by moving: that would press it. Not
+    // moving (the end of a row) taps nothing either.
+    if set.selected == Some(next) || next == index {
         return (next, Vec::new());
     }
     (next, vec![rect_center(set.rects[next])])
+}
+
+/// The Results screen (`Result_Main`, work through the task table): its flow
+/// (`+0x0`, `Result_Main`'s switch at 0x47fc4) while the pearls are split
+/// (`ResultFlow_DivideSelect`, 0x46ba4), and that flow's sub-state (`+0x4`,
+/// switch at 0x46bbc) while it takes touches: 0 sets up, 2 a message, 3 the
+/// rank-up dialog, 4 EXIT's animation.
+const RESULT_DIVIDE_FLOW: u32 = 13;
+const RESULT_DIVIDE_TAKING_TOUCHES: u32 = 1;
+/// The EXIT icon: slot 4 (x 412-460, y 228-300), which leaves on one tap.
+const RESULT_EXIT: (f32, f32) = (436.0, 264.0);
+
+/// The pearl split's troopers as a two-tap button set: `count` (`+0x1c`, at
+/// most four) slots along the bottom, a finger-up at x 156 + 64i to
+/// 204 + 64i, y 228 to 300 (`DivideSelect`'s hit test), the selected one
+/// `selected` (`+0xc`). A tap on another selects it (SE 2, its status); on
+/// the selected one, it asks to rank it up (or says why it can't). EXIT is
+/// back, not a slot the D-pad reaches, since one tap on it leaves.
+pub fn result_divide_set(count: usize, selected: i32) -> ButtonSet {
+    let count = count.min(4);
+    let rects = (0..count)
+        .map(|i| (156.0 + 64.0 * i as f32, 228.0, 48.0, 72.0))
+        .collect();
+    ButtonSet {
+        rects,
+        enabled: vec![true; count],
+        back: Some(RESULT_EXIT),
+        two_tap: true,
+        selected: usize::try_from(selected).ok().filter(|&i| i < count),
+    }
 }
 
 /// A sprite's rectangle as `SysPrim_Touch_DrawRect` tests it: `_prim_work`
@@ -786,30 +930,87 @@ pub struct ListMenu {
     /// Not scrolling.
     pub settled: bool,
     pub cursor: usize,
-    /// The menu's own box across (x, width: `+0xd08`, `+0xd0c`), which
-    /// its rows overhang on the right.
-    pub span: Option<(f32, f32)>,
+    /// The menu's x (`+0xd08`), where its highlight starts (its rows
+    /// start a little further right).
+    pub menu_x: Option<f32>,
+    /// The game's own highlight sprite.
+    pub highlight: ListHighlight,
+    /// Where back taps: off the rows, the list's cancel (`SysMenu_Check2`
+    /// returns −2); or a screen's own back icon where a tap off the rows
+    /// does nothing (the shop's older `SysMenu_Check`).
+    pub back: (f32, f32),
 }
 
-/// How far the controller's outline is pulled in from a list row: the
-/// marker is drawn about 3 points outside the rectangle, and rows are
-/// packed edge to edge.
-const LIST_OUTLINE_INSET: (f32, f32) = (4.0, 3.0);
+/// A `SysMenu`'s row highlight (the sprite at `+0xd28`, opened by
+/// `SysMenu_Open` untextured in [LIST_HIGHLIGHT_COLOR]), which the game
+/// shows under a finger held on a row (`SysMenu_Check2` →
+/// `SysMenu_Disp_Cursor`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ListHighlight {
+    /// Its size, once it has one.
+    pub size: Option<(f32, f32)>,
+    /// Placed by its centre (`_prim_work + 0x38`).
+    pub centred: bool,
+    /// The game is showing it.
+    pub shown: bool,
+}
 
-/// The outline for a `SysMenu` row: inside the menu's box across (`span`,
-/// if it overlaps the row), pulled in on the right and at the top and
-/// bottom. A row's touch area starts inside the panel but is as wide as
-/// the menu, so it overhangs the panel's right edge.
-pub fn list_outline((x, y, w, h): (f32, f32, f32, f32), span: Option<(f32, f32)>) -> (f32, f32, f32, f32) {
-    let (ix, iy) = LIST_OUTLINE_INSET;
-    let mut right = x + w;
-    if let Some((sx, sw)) = span {
-        let clipped = right.min(sx + sw);
-        if clipped > x.max(sx) {
-            right = clipped;
-        }
+/// Where the game would put its highlight for `row`: at the menu's x and
+/// one point above the row (`SysMenu_Disp_Cursor`), at its own size (the
+/// row's until it has one).
+pub fn list_highlight(
+    (rx, ry, rw, rh): (f32, f32, f32, f32),
+    menu_x: Option<f32>,
+    highlight: &ListHighlight,
+) -> (f32, f32, f32, f32) {
+    let (w, h) = highlight
+        .size
+        .filter(|&(w, h)| w > 0.0 && h > 0.0)
+        .unwrap_or((rw, rh));
+    prim_rect(menu_x.unwrap_or(rx), ry - 1.0, w, h, highlight.centred)
+}
+
+/// The controller's marker on a list row: a copy of the game's highlight,
+/// or nothing while the game's own shows (a finger on a row), so the two
+/// never add up.
+/// What the play look does with a screen's outline. The debug look
+/// (`--controller-debug`) always shows the outline as the screen made it.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum Clean {
+    /// Show it as it is (a copy of the game's own highlight already, or
+    /// a tile the game can't show its cursor on).
+    #[default]
+    Same,
+    /// Nothing: the game shows the selection itself (the title drum's
+    /// band, the centred card, its own tile cursor).
+    Hide,
+    /// A copy of the game's own highlight on the same rectangle, for
+    /// screens with no resting selected look of their own.
+    Highlight,
+    /// The same, on another rectangle: a dialog button's art, where the
+    /// outline leaves space around it.
+    HighlightAt((f32, f32, f32, f32)),
+}
+
+/// The outline to draw, in the play look or the debug look.
+pub fn play_look(marker: Option<FocusMarker>, clean: Clean, debug: bool) -> Option<FocusMarker> {
+    if debug {
+        return marker;
     }
-    (x, y + iy, (right - ix - x).max(1.0), (h - 2.0 * iy).max(1.0))
+    match clean {
+        Clean::Same => marker,
+        Clean::Hide => None,
+        Clean::Highlight => marker.map(|(rect, _)| (rect, FocusShape::Highlight)),
+        Clean::HighlightAt(rect) => marker.map(|_| (rect, FocusShape::Highlight)),
+    }
+}
+
+pub fn list_marker(
+    row: (f32, f32, f32, f32),
+    menu_x: Option<f32>,
+    highlight: &ListHighlight,
+) -> Option<FocusMarker> {
+    (!highlight.shown).then(|| (list_highlight(row, menu_x, highlight), FocusShape::Highlight))
 }
 
 impl ListMenu {
@@ -819,6 +1020,17 @@ impl ListMenu {
         self.settled && i >= first && i < first + self.shown
     }
 
+    /// The nearest row to `i` that's on screen, for a list that won't
+    /// scroll (see [State::list_scroll]).
+    pub fn clamp_to_shown(&self, i: usize) -> usize {
+        let Some(last_row) = self.rows.len().checked_sub(1) else {
+            return i;
+        };
+        let first = (self.first.round().max(0.0) as usize).min(last_row);
+        let last = (first + self.shown.max(1) - 1).min(last_row);
+        i.clamp(first, last)
+    }
+
     /// A drag scrolling the list a row toward row `i`, if it's off screen
     /// and the list is still.
     pub fn scroll_toward(&self, i: usize) -> Option<Gesture> {
@@ -826,10 +1038,38 @@ impl ListMenu {
             return None;
         }
         let first = (self.first.round().max(0.0) as usize).min(self.rows.len() - 1);
-        let (x, y) = rect_center(self.rows[first]);
-        // Finger up moves the list on to later rows.
-        let dy = if i < first { LIST_DRAG } else { -LIST_DRAG };
+        let (_, y) = rect_center(self.rows[first]);
+        // Down just left of the rows: `SysMenu_Check` (the shop's list)
+        // makes a row under a finger going down the cursor and clears the
+        // touch state, which may be what kept its drags from scrolling.
+        let x = (self.rows[first].0 / 2.0).max(1.0);
+        // Finger up moves the list on to later rows (the speed is
+        // -dy / 24).
+        let dy = if i >= first { -LIST_DRAG } else { LIST_DRAG };
         Some(Gesture::Drag { x, y, dy })
+    }
+}
+
+/// What a scroll drag did to a list, once it's still again.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScrollOutcome {
+    /// It moved the way it was meant to.
+    Moved,
+    /// It moved the other way.
+    Reversed,
+    /// It didn't move.
+    Still,
+}
+
+/// Judge a scroll drag from the list's position before and after it, and
+/// whether it was meant to bring on later rows.
+pub fn judge_scroll(before: f32, after: f32, wanted_later: bool) -> ScrollOutcome {
+    if after == before {
+        ScrollOutcome::Still
+    } else if (after > before) == wanted_later {
+        ScrollOutcome::Moved
+    } else {
+        ScrollOutcome::Reversed
     }
 }
 
@@ -852,8 +1092,9 @@ pub fn list_command(
             (focus, Some(Some(rect_center(list.rows[focus]))))
         }
         Role::Confirm => (focus, None),
-        // A tap off every row is the list's cancel (SysMenu_Check2: -2).
-        Role::Back => (focus, Some(Some(OUTSIDE))),
+        // A tap off every row is the list's cancel (SysMenu_Check2: -2), or
+        // the screen's back icon.
+        Role::Back => (focus, Some(Some(list.back))),
         _ => (focus, Some(None)),
     }
 }
@@ -1164,6 +1405,180 @@ pub fn drum_command(drum: &Drum, role: Role) -> Option<(f32, f32)> {
     }
 }
 
+/// How far a flick moves the finger to turn a shop quantity drum one digit.
+/// `SysDrum_Check` makes it a speed of -dy / 24 digits a frame, which
+/// `drummenumain` slows by 20% a frame and, below 0.1, nudges to the
+/// nearest digit (song-summoner-re.md, The shop). Worked through, 5 to 7.5
+/// turn it one digit either way; 6 takes 8 frames. The controller checks
+/// the digit after each flick anyway.
+const DIAL_DRAG: f32 = 6.0;
+
+/// One of the drums of the shop's quantity dial (the older `SysDrum`,
+/// task main `drummenumain`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DialDrum {
+    pub work: u32,
+    /// Where it takes touches (`+0x1610` position, `+0x1614` size).
+    pub rect: (f32, f32, f32, f32),
+    /// The digit it's on (the item at the cursor `+2`: its `+0x38`).
+    pub digit: i32,
+    /// It has stopped (`SysDrum_CheckCursordisp`: no speed, no nudge).
+    pub settled: bool,
+    /// Where the game draws its own band on it (the cursor sprite, id at
+    /// `+0x1624`, a `button_001.png` frame), if it's there.
+    pub band: Option<(f32, f32, f32, f32)>,
+}
+
+/// The shop's quantity dial: its drums, most significant (leftmost) first.
+/// The amount is tens × 10 + ones (`ShopFlow_BuyMenu`, 0x13ac4).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dial {
+    pub drums: Vec<DialDrum>,
+}
+
+impl Dial {
+    pub fn digits(&self) -> Vec<i32> {
+        self.drums.iter().map(|d| d.digit).collect()
+    }
+
+    pub fn settled(&self) -> bool {
+        self.drums.iter().all(|d| d.settled)
+    }
+
+    /// The outline for drum `i`: its middle band, where the chosen digit
+    /// shows.
+    pub fn band(&self, i: usize) -> (f32, f32, f32, f32) {
+        let (x, y, w, h) = self.drums[i].rect;
+        (x, y + h / 2.0 - 18.0, w, 36.0)
+    }
+
+    /// Where the play look's copy of the highlight goes on drum `i`: over
+    /// the game's own band (drawn on every drum), so the picked one shows
+    /// brighter; the middle band if the band sprite isn't there.
+    pub fn highlight(&self, i: usize) -> (f32, f32, f32, f32) {
+        self.drums[i].band.map_or_else(|| self.band(i), button_art)
+    }
+}
+
+/// The dialog button a dial command presses.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DialPress {
+    /// Confirm (the right button).
+    Confirm,
+    /// Forget it (the left button).
+    Forget,
+}
+
+/// What a command does on the dial (the user's layout, 2026-09-28):
+/// left/right pick a drum, up/down turn the picked one's target digit
+/// the way the drum shows it: up brings in the digit above (one less),
+/// down the one below (one more), wrapping as the drum does (the user's
+/// choice, 2026-09-28). Confirm and back press the dialog's
+/// Confirm and Forget it. Returns the new focus and the press, if any.
+pub fn dial_command(
+    focus: usize,
+    target: &mut [i32],
+    role: Role,
+) -> (usize, Option<DialPress>) {
+    let last = target.len().saturating_sub(1);
+    match role {
+        Role::PrevSection => (focus.saturating_sub(1), None),
+        Role::NextSection => ((focus + 1).min(last), None),
+        Role::Up | Role::Down => {
+            if let Some(digit) = target.get_mut(focus) {
+                let step = if role == Role::Up { -1 } else { 1 };
+                *digit = (*digit + step).rem_euclid(10);
+            }
+            (focus, None)
+        }
+        Role::Confirm => (focus, Some(DialPress::Confirm)),
+        Role::Back => (focus, Some(DialPress::Forget)),
+        _ => (focus, None),
+    }
+}
+
+/// The next flick to bring the dial to `target`, the leftmost drum that's
+/// off first, the short way round; `None` while it's turning or once it's
+/// there. A finger going up turns a drum to the next digit.
+pub fn dial_step(dial: &Dial, target: &[i32]) -> Option<Gesture> {
+    if !dial.settled() {
+        return None;
+    }
+    let (drum, &want) = dial
+        .drums
+        .iter()
+        .zip(target)
+        .find(|&(drum, &want)| drum.digit != want)?;
+    let forward = (want - drum.digit).rem_euclid(10) <= 5;
+    let (x, y) = rect_center(drum.rect);
+    let dy = if forward { -DIAL_DRAG } else { DIAL_DRAG };
+    Some(Gesture::Drag { x, y, dy })
+}
+
+/// Where a dial press taps: the dialog's rightmost button for Confirm,
+/// its leftmost for Forget it.
+pub fn dial_press_point(dialog: &Dialog, press: DialPress) -> Option<(f32, f32)> {
+    let by_x = |a: &&(f32, f32, f32, f32), b: &&(f32, f32, f32, f32)| a.0.total_cmp(&b.0);
+    let rect = match press {
+        DialPress::Confirm => dialog.rects.iter().max_by(by_x),
+        DialPress::Forget => dialog.rects.iter().min_by(by_x),
+    }?;
+    Some(rect_center(*rect))
+}
+
+/// A button was pressed recently enough that the play look still hides
+/// its menu's highlight (see [PRESS_HIDE_FRAMES]).
+pub fn just_pressed(pressed_at: Option<u64>, frame: u64) -> bool {
+    pressed_at.is_some_and(|at| frame < at + PRESS_HIDE_FRAMES)
+}
+
+/// The play look for touchHLE's diamond: only on a tile a finger can't be
+/// held on (`holdable` false) once the camera can't pan any further to
+/// bring it in (`stuck`, a pan that didn't move it). Until then the finger
+/// is on its way and the game's own cursor follows it; showing it in
+/// between flashed an orange diamond as a unit was picked (2026-09-28).
+pub fn diamond_look(holdable: bool, stuck: bool) -> Clean {
+    if !holdable && stuck {
+        Clean::Same
+    } else {
+        Clean::Hide
+    }
+}
+
+/// Where to tap to select a select-then-press screen's first item when it
+/// opens, if that's due: nothing selected yet, the controller in use (a
+/// finger chooses for itself), not done already this opening, and the
+/// item enabled.
+pub fn preselect_tap(
+    set: &ButtonSet,
+    index: usize,
+    pad_mode: bool,
+    done: bool,
+) -> Option<(f32, f32)> {
+    if !set.two_tap || set.selected.is_some() || !pad_mode || done {
+        return None;
+    }
+    if set.enabled.get(index) != Some(&true) {
+        return None;
+    }
+    set.rects.get(index).copied().map(rect_center)
+}
+
+/// The controller's own state on the dial.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DialState {
+    /// The dial (its first drum's work), so a new one starts afresh.
+    pub work: u32,
+    /// The drum picked.
+    pub focus: usize,
+    /// The digits the drums are being turned to.
+    pub target: Vec<i32>,
+    /// Each drum's band as last seen: the game hides it while the drum
+    /// turns, and falling back to the middle band then made the copy grow
+    /// on every step (2026-09-28).
+    pub bands: Vec<Option<(f32, f32, f32, f32)>>,
+}
+
 /// The Options screen's volume knob: its centre's height, and the range
 /// its centre moves over (`Option_Check` sets the volume to (x - 254) / 200).
 const OPTION_KNOB_Y: f32 = 64.0;
@@ -1285,9 +1700,27 @@ const HELP_LIST_BOTTOM: f32 = 256.0;
 const HELP_SLACK: f32 = 3.0;
 /// Where a scroll drag starts: mid-list, off the tabs and the side edges.
 const HELP_DRAG_FROM: (f32, f32) = (240.0, 144.0);
-/// `Help2_Main` adds a drag's last move to the scroll position and keeps
-/// adding it, 10% less each frame: ten times the move in all.
-const HELP_GLIDE: f32 = 10.0;
+/// How far a scroll drag's move takes Help's list or page before
+/// [help_stop] stops it. `Help2_Main` sets the speed to the move, adds the
+/// speed to the position every frame (0x60e36), 10% less each time, and
+/// zeroes it when a finger goes down: the move's frame and the next (the
+/// finger-up's) add 1.9 times the move before the stop's finger-down.
+/// (Left to glide, it would be ten times, over some 45 frames.)
+const HELP_DRAG_GAIN: f32 = 1.9;
+
+/// The touch that stops a Help scroll drag's glide: down where the drag
+/// ended (which zeroes the speed), a 1-point slide sideways (so its
+/// finger-up is a flick, which opens nothing; a swipe takes 24), up.
+pub fn help_stop(drag: Gesture) -> Option<Gesture> {
+    match drag {
+        Gesture::Drag { x, y, dy } => Some(Gesture::Slide {
+            x,
+            y: y + dy,
+            to_x: x + 1.0,
+        }),
+        _ => None,
+    }
+}
 /// An item page scrolls half its 272-point view per up/down press.
 const HELP_PAGE_STEP: f32 = 136.0;
 /// Tabs are 80 points wide along the bottom; the sixth is Exit.
@@ -1357,7 +1790,7 @@ impl Help {
         Some(Gesture::Drag {
             x,
             y,
-            dy: -need / HELP_GLIDE,
+            dy: -need / HELP_DRAG_GAIN,
         })
     }
 
@@ -1381,8 +1814,8 @@ pub fn help_command(help: &Help, focus: usize, role: Role) -> (usize, Option<Opt
         };
         return match role {
             // Finger down shows the text above.
-            Role::Up => (focus, scroll(HELP_PAGE_STEP / HELP_GLIDE)),
-            Role::Down => (focus, scroll(-HELP_PAGE_STEP / HELP_GLIDE)),
+            Role::Up => (focus, scroll(HELP_PAGE_STEP / HELP_DRAG_GAIN)),
+            Role::Down => (focus, scroll(-HELP_PAGE_STEP / HELP_DRAG_GAIN)),
             _ if prev && selected > 0 => (focus, tap(HELP_PREV_ITEM)),
             _ if next && selected + 1 < help.count => (focus, tap(HELP_NEXT_ITEM)),
             Role::Back => (focus, tap(HELP_CLOSE)),
@@ -1408,6 +1841,124 @@ pub fn help_command(help: &Help, focus: usize, role: Role) -> (usize, Option<Opt
     }
 }
 
+/// The shop's password keyboard (`Keyboard_Main`, song-summoner-re.md, The
+/// shop's password keyboard): `getkeybord`'s table (`keyrect`, 0x6ea48) of
+/// x, y, width, height and the key, in screen points (the table's y is
+/// 160 higher up). A finger-up types the key the finger was last on; the
+/// game shows I and O as 1 and 0.
+pub const KEYBOARD_KEYS: [(f32, f32, f32, f32, u8); 39] = [
+    // Digits.
+    (9.0, 164.0, 39.0, 32.0, b'1'),
+    (56.0, 164.0, 39.0, 32.0, b'2'),
+    (103.0, 164.0, 39.0, 32.0, b'3'),
+    (150.0, 164.0, 39.0, 32.0, b'4'),
+    (197.0, 164.0, 39.0, 32.0, b'5'),
+    (244.0, 164.0, 39.0, 32.0, b'6'),
+    (291.0, 164.0, 39.0, 32.0, b'7'),
+    (338.0, 164.0, 39.0, 32.0, b'8'),
+    (385.0, 164.0, 39.0, 32.0, b'9'),
+    (432.0, 164.0, 39.0, 32.0, b'0'),
+    // Q to P (I and O show as 1 and 0).
+    (9.0, 204.0, 39.0, 32.0, b'Q'),
+    (56.0, 204.0, 39.0, 32.0, b'W'),
+    (103.0, 204.0, 39.0, 32.0, b'E'),
+    (150.0, 204.0, 39.0, 32.0, b'R'),
+    (197.0, 204.0, 39.0, 32.0, b'T'),
+    (244.0, 204.0, 39.0, 32.0, b'Y'),
+    (291.0, 204.0, 39.0, 32.0, b'U'),
+    (338.0, 204.0, 39.0, 32.0, b'1'),
+    (385.0, 204.0, 39.0, 32.0, b'0'),
+    (432.0, 204.0, 39.0, 32.0, b'P'),
+    // A to L, then Backspace.
+    (9.0, 244.0, 39.0, 32.0, b'A'),
+    (56.0, 244.0, 39.0, 32.0, b'S'),
+    (103.0, 244.0, 39.0, 32.0, b'D'),
+    (150.0, 244.0, 39.0, 32.0, b'F'),
+    (197.0, 244.0, 39.0, 32.0, b'G'),
+    (244.0, 244.0, 39.0, 32.0, b'H'),
+    (291.0, 244.0, 39.0, 32.0, b'J'),
+    (338.0, 244.0, 39.0, 32.0, b'K'),
+    (385.0, 244.0, 39.0, 32.0, b'L'),
+    (432.0, 244.0, 39.0, 32.0, KEY_BACKSPACE),
+    // The bottom row is set in, between the wider quit and Enter keys.
+    (9.0, 285.0, 51.0, 30.0, KEY_QUIT),
+    (80.0, 284.0, 39.0, 32.0, b'Z'),
+    (127.0, 284.0, 39.0, 32.0, b'X'),
+    (174.0, 284.0, 39.0, 32.0, b'C'),
+    (221.0, 284.0, 39.0, 32.0, b'V'),
+    (268.0, 284.0, 39.0, 32.0, b'B'),
+    (315.0, 284.0, 39.0, 32.0, b'N'),
+    (362.0, 284.0, 39.0, 32.0, b'M'),
+    (419.0, 285.0, 51.0, 30.0, KEY_ENTER),
+];
+/// Deletes the last character.
+pub const KEY_BACKSPACE: u8 = b'b';
+/// Checks the password (`Keyboard_Main` state 2).
+pub const KEY_ENTER: u8 = b'e';
+/// Asks whether to stop entering the password (a `SysDialog`).
+pub const KEY_QUIT: u8 = b'r';
+
+fn key_rect(i: usize) -> (f32, f32, f32, f32) {
+    let (x, y, w, h, _) = KEYBOARD_KEYS[i];
+    (x, y, w, h)
+}
+
+fn key_index(key: u8) -> Option<usize> {
+    KEYBOARD_KEYS.iter().position(|k| k.4 == key)
+}
+
+fn key_point(key: u8) -> Option<(f32, f32)> {
+    Some(rect_center(key_rect(key_index(key)?)))
+}
+
+/// The password keyboard key a real key types (desktop; SDL scancode
+/// names): letters and digits, keypad digits, Backspace, and Return or
+/// Keypad Enter for Enter. The game has no I or O (its keys there are 1
+/// and 0), so those type 1 and 0. Other keys keep their mapping.
+pub fn typed_key(name: &str) -> Option<u8> {
+    match name {
+        "Backspace" => return Some(KEY_BACKSPACE),
+        "Return" | "Keypad Enter" => return Some(KEY_ENTER),
+        _ => {}
+    }
+    let name = name.strip_prefix("Keypad ").unwrap_or(name);
+    let &[c] = name.as_bytes() else {
+        return None;
+    };
+    match c {
+        b'I' => Some(b'1'),
+        b'O' => Some(b'0'),
+        b'A'..=b'Z' | b'0'..=b'9' => Some(c),
+        _ => None,
+    }
+}
+
+/// One command on the password keyboard with key `focus` focused and
+/// `typed` characters entered: the new focus, and where to tap. The D-pad
+/// moves as on any buttons ([step_toward]), confirm types the key, and
+/// back is Backspace, or with nothing typed the key that asks to leave.
+pub fn keyboard_command(focus: usize, typed: usize, role: Role) -> (usize, Option<(f32, f32)>) {
+    let focus = focus.min(KEYBOARD_KEYS.len() - 1);
+    match role {
+        Role::Up | Role::Down | Role::PrevSection | Role::NextSection => {
+            let rects: Vec<_> = (0..KEYBOARD_KEYS.len()).map(key_rect).collect();
+            let enabled = [true; KEYBOARD_KEYS.len()];
+            (step_toward(&rects, &enabled, focus, role), None)
+        }
+        Role::Confirm => (focus, Some(rect_center(key_rect(focus)))),
+        Role::Back if typed > 0 => (focus, key_point(KEY_BACKSPACE)),
+        Role::Back => (focus, key_point(KEY_QUIT)),
+        _ => (focus, None),
+    }
+}
+
+/// Where the shop's top menu (`ShopFlow_MenuSelect`) also takes a tap: a
+/// finger-up at x 40-192, y 108 or more (over the shopkeeper) opens the
+/// password entry. There's no button for it: the Info button taps it,
+/// and the Setup menu's HUD shows a pill saying so (the user's choice,
+/// 2026-09-28).
+const SHOP_PASSWORD_TAP: (f32, f32) = (116.0, 204.0);
+
 /// Something on screen the controller drives.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Widget {
@@ -1426,6 +1977,9 @@ pub enum Widget {
     List(ListMenu),
     /// The world map, which highlights its own locations.
     World(WorldMap),
+    /// The shop's password keyboard (its work), with how many characters
+    /// are typed.
+    Keyboard { work: u32, typed: usize },
 }
 
 impl Widget {
@@ -1436,7 +1990,7 @@ impl Widget {
             Widget::Options(options) => options.work,
             Widget::Buttons(menu) => menu.work,
             Widget::Dialog(dialog) => dialog.work,
-            Widget::Scene { work, .. } | Widget::Cards { work, .. } => *work,
+            Widget::Scene { work, .. } | Widget::Cards { work, .. } | Widget::Keyboard { work, .. } => *work,
             Widget::List(list) => list.work,
             Widget::Drum(drum) => drum.work,
         }
@@ -1457,6 +2011,9 @@ struct Game {
     button_menu_main: u32,
     dialog_main: u32,
     drum2_main: u32,
+    /// `drummenumain`, the older `SysDrum` (the shop's quantity dial); 0
+    /// if missing.
+    drum_main: u32,
     list_menu_main: u32,
     /// 0 if this copy of the game lacks them.
     option_main: u32,
@@ -1505,6 +2062,19 @@ struct Game {
     /// `TacticsMapCursor_Set_Zoom(percent, frames, mode)`, which doesn't
     /// use the task work, so the host can call it; `None` if missing.
     set_zoom: Option<GuestFunction>,
+    /// `_tactics_script_flag` (set while a battle script runs, in any
+    /// phase) and `_mesmanage` (`+0x0` the "tap to continue" mark's
+    /// `SysAnim`, `+0x4` it's enabled); 0 if missing.
+    script_flag: u32,
+    mesmanage: u32,
+    /// The Results screen's and the shop's task mains, and the password
+    /// keyboard's; 0 if missing.
+    result_main: u32,
+    shop_main: u32,
+    keyboard_main: u32,
+    /// `SysTouch_Clear`: forgets every finger (count, down, flick) without
+    /// a finger-up, for a held virtual finger that has to go.
+    touch_clear: GuestFunction,
     task_manage: u32,
     prim_work: u32,
     card_list_work: u32,
@@ -1515,7 +2085,7 @@ struct Game {
     m_mode_offset: ConstPtr<u32>,
 }
 
-/// What the battle handlers past unit select keep between frames
+/// What the battle handlers keep between frames
 /// (song-summoner-re.md, "Battle controller plan"). Reset whenever the
 /// phase or the handler's own screen changes.
 #[derive(Default)]
@@ -1554,6 +2124,14 @@ struct BattleInput {
     origin: Option<(f32, f32)>,
     /// Why presses were last waiting, to log each reason once.
     waiting: Option<String>,
+    /// Unit select: the game's cursor last seen (to follow it when the
+    /// game moves it: the arrows, a selection, a new turn), whether our own
+    /// lift or pan is what moved it last (a release puts it back on the
+    /// selected unit, which ours ignores), and a tap to make once the
+    /// finger is up (the arrows, MENU).
+    seen: Option<Tile>,
+    ours: bool,
+    pending_tap: Option<(f32, f32)>,
 }
 
 #[derive(Default)]
@@ -1562,6 +2140,27 @@ pub struct State {
     /// Controller commands waiting for the next frame, where the menus
     /// they act on are read.
     commands: VecDeque<Role>,
+    /// The password keyboard was up last frame, and keys typed on a real
+    /// keyboard waiting to be tapped on it ([typed_key]).
+    password_keyboard: bool,
+    typed_keys: VecDeque<u8>,
+    /// Android's on-screen keyboard is up for it.
+    soft_keyboard: bool,
+    /// The shop's top menu is up (for the Password pill).
+    shop_menu: bool,
+    /// How long they've waited unused.
+    command_age: CommandAge,
+    /// On the shop's quantity dial: the drum picked and the target digits.
+    dial: Option<DialState>,
+    /// What the play look does with this frame's outline, set by the
+    /// screen that made it.
+    clean_look: Clean,
+    /// A select-then-press screen (its work) whose first item the
+    /// controller has selected, as a first tap would, so it's done once.
+    preselected: Option<u32>,
+    /// The frame the controller last pressed a menu's or dialog's button
+    /// (see [PRESS_HIDE_FRAMES]); cleared by any other command.
+    pressed_at: Option<u64>,
     /// The controller was used more recently than touch: show its focus.
     pad_mode: bool,
     /// The menu with the focus (its work address) and the focused button.
@@ -1578,6 +2177,12 @@ pub struct State {
     /// Frames since the last scroll drag, so a drag's glide shows up in the
     /// list's speed before the next is judged.
     since_drag: u32,
+    /// A `SysMenu` list (its work), its scroll position when the last
+    /// scroll drag was made, and whether that drag was meant to bring on
+    /// later rows. Once the list is still again it's judged
+    /// ([judge_scroll]); a list that didn't move gets no more drags, and
+    /// the focus stays on the rows shown.
+    list_scroll: Option<(u32, f32, bool)>,
     /// Menus open last frame (work addresses), to spot a new one.
     known_menus: Vec<u32>,
     /// Running tasks' main functions last frame, and the outline last
@@ -1592,25 +2197,10 @@ pub struct State {
     /// The lit tiles and target lists last logged (phase, lit tiles, each
     /// list's name and tiles).
     logged_targets: Option<(u32, Vec<(Tile, i32)>, Vec<(String, Vec<Tile>)>)>,
-    /// Battle, unit select: touchHLE's tile cursor (with the Tactics work it
-    /// belongs to), the game's cursor last seen (to follow it when the game
-    /// moves it), the camera last frame (to act only while it's still), the
-    /// camera when the last pan started, a confirm waiting for the cursor's
-    /// tile to be holdable, and our own pan or hold under way (whose
-    /// release moves the game's cursor, which mustn't move ours).
-    battle_cursor: Option<(u32, Tile)>,
-    battle_seen: Option<Tile>,
-    battle_origin: Option<(f32, f32)>,
-    battle_pan: Option<(f32, f32)>,
-    battle_confirm: bool,
-    battle_touching: bool,
     /// Whether the confirm button is down now (battle's confirm holds a
     /// finger for as long as it is).
     confirm_down: bool,
-    /// Why presses were last waiting in unit select (its state, camera
-    /// still, no tap under way), to log each reason once.
-    battle_waiting: Option<(u32, bool, bool)>,
-    /// The held finger of the battle screens past unit select.
+    /// The held finger of the battle screens.
     finger: Finger,
     /// Those screens' own state.
     battle_input: BattleInput,
@@ -1645,6 +2235,7 @@ fn lookup(env: &Environment) -> Option<Game> {
         button_menu_main: get("__Z18SysButtonMenu_Mainv")? & !1,
         dialog_main: get("__ZL10dialogmainv")? & !1,
         drum2_main: get("__ZL13drummenumain2v")? & !1,
+        drum_main: optional("__ZL12drummenumainv") & !1,
         list_menu_main: get("__ZL12Menumenumainv")? & !1,
         option_main: symbols.get("__Z11Option_Mainv").map_or(0, |a| a & !1),
         help_main: symbols.get("__Z10Help2_Mainv").map_or(0, |a| a & !1),
@@ -1679,6 +2270,12 @@ fn lookup(env: &Environment) -> Option<Game> {
         set_zoom: symbols
             .get("__Z25TacticsMapCursor_Set_Zoomiii")
             .map(|&a| thumb(a)),
+        touch_clear: thumb(get("__Z14SysTouch_Clearv")?),
+        script_flag: optional("_tactics_script_flag"),
+        result_main: optional("__Z11Result_Mainv") & !1,
+        shop_main: optional("__Z9Shop_Mainv") & !1,
+        keyboard_main: optional("__Z13Keyboard_Mainv") & !1,
+        mesmanage: optional("_mesmanage"),
         task_manage: get("_task_manage")?,
         prim_work: get("_prim_work")?,
         card_list_work: get("_cardlist_work")?,
@@ -1853,11 +2450,83 @@ fn scene_buttons(env: &Environment, game: Game, over_cards: bool) -> Option<(u32
     None
 }
 
+/// While a list's scroll drag is being judged, log each frame what the
+/// list and the game's touch state (`_touch_work`) do: the shop's list
+/// didn't scroll for one (2026-09-28).
+fn log_list_drag(env: &Environment, game: Game, widgets: &[Widget]) {
+    let state = &env.framework_state.song_summoner.game_input;
+    if !cfg!(debug_assertions) || state.list_scroll.is_none() || game.touch_work == 0 {
+        return;
+    }
+    let Some(list) = widgets.iter().find_map(|w| match w {
+        Widget::List(list) => Some(list),
+        _ => None,
+    }) else {
+        return;
+    };
+    let t = game.touch_work;
+    log!(
+        "input: list after drag (frame {}): at {}, speed {}, cursor {}; touch down {} flick {} began {} ended {} count {}",
+        state.frame,
+        read_f32(env, list.work + 0xd18),
+        read_f32(env, list.work + 0xd1c),
+        read_i8(env, list.work + 2),
+        read_u32(env, t + 0x10),
+        read_u32(env, t + 0x14),
+        read_u32(env, t + 0x54),
+        read_u32(env, t + 0x58),
+        read_u32(env, t + 0xc)
+    );
+}
+
+/// The shop's quantity dial, if one is open: every running `drummenumain`
+/// task's drum, left to right.
+fn read_dial(env: &Environment, game: Game) -> Option<Dial> {
+    if game.drum_main == 0 {
+        return None;
+    }
+    let mut drums: Vec<DialDrum> = (0..TASK_SLOTS)
+        .map(|slot| game.task_manage + slot * TASK_SLOT_SIZE)
+        .filter(|&base| {
+            read_u32(env, base) == TASK_RUNNING
+                && read_u32(env, base + 0x10) & !1 == game.drum_main
+        })
+        .map(|base| read_u32(env, base + 0x18))
+        .filter(|&work| work >= 0x1000)
+        .filter_map(|work| {
+            let count = read_i8(env, work + 4);
+            let cursor = read_i8(env, work + 2);
+            if count <= 0 || cursor < 0 || cursor >= count {
+                return None;
+            }
+            let digit = read_u32(env, work + 0x38 + cursor as u32 * 0x2c) as i32;
+            Some(DialDrum {
+                work,
+                rect: (
+                    f32::from(read_i16(env, work + 0x1610)),
+                    f32::from(read_i16(env, work + 0x1612)),
+                    f32::from(read_i16(env, work + 0x1614)),
+                    f32::from(read_i16(env, work + 0x1616)),
+                ),
+                digit,
+                settled: read_f32(env, work + 0x1620) == 0.0
+                    && read_f32(env, work + 0x1628).abs() < 1.0e-5,
+                band: read_prim_rect(env, game, read_u32(env, work + 0x1624)),
+            })
+        })
+        .collect();
+    if drums.is_empty() {
+        return None;
+    }
+    drums.sort_by(|a, b| a.rect.0.total_cmp(&b.rect.0));
+    Some(Dial { drums })
+}
+
 fn read_i8(env: &Environment, addr: u32) -> i8 {
     env.mem.read(ConstPtr::<i8>::from_bits(addr))
 }
 
-fn read_list(env: &Environment, work: u32) -> Option<ListMenu> {
+fn read_list(env: &Environment, prim_work: u32, work: u32) -> Option<ListMenu> {
     let count = read_i8(env, work + 4);
     if count <= 0 {
         return None;
@@ -1884,7 +2553,90 @@ fn read_list(env: &Environment, work: u32) -> Option<ListMenu> {
         shown: read_i8(env, work + 5).max(1) as usize,
         settled: read_f32(env, work + 0xd1c) == 0.0,
         cursor: (read_i8(env, work + 2).max(0) as usize).min(count as usize - 1),
-        span: Some((f32::from(read_i16(env, work + 0xd08)), width)).filter(|&(_, w)| w > 0.0),
+        menu_x: Some(f32::from(read_i16(env, work + 0xd08))),
+        highlight: read_list_highlight(env, prim_work, read_u32(env, work + 0xd28)),
+        back: OUTSIDE,
+    })
+}
+
+/// The game's list highlight sprite `id` (see [ListHighlight]), read from
+/// the sprite table whether it's shown or not.
+fn read_list_highlight(env: &Environment, prim_work: u32, id: u32) -> ListHighlight {
+    // Ids are small table indices; anything else means a misread.
+    if prim_work == 0 || id >= 0x1000 {
+        return ListHighlight {
+            size: None,
+            centred: false,
+            shown: false,
+        };
+    }
+    let entry = prim_work + id * PRIM_SIZE;
+    let in_use = read_u32(env, entry) != 0;
+    ListHighlight {
+        size: in_use.then(|| (read_f32(env, entry + 0x14), read_f32(env, entry + 0x18))),
+        centred: read_u32(env, entry + 0x38) != 0,
+        shown: in_use && read_u32(env, entry + 8) != 0,
+    }
+}
+
+/// The shop (`Shop_Main`, work through the task table): its flow (`+0x0`,
+/// `Shop_Main`'s switch at 0x14274) while buying or selling
+/// (`ShopFlow_BuyMenu`, `_SellMenu`), whose lists are the older
+/// `SysMenu_Check` (a tap off the rows does nothing) and whose back icon
+/// is the sprite at `+0x20` (both hit-test it with `SysPrim_Touch_DrawRect`).
+const SHOP_BUY: u32 = 6;
+const SHOP_SELL: u32 = 7;
+
+/// The shop's top menu (`ShopFlow_MenuSelect`) is up: flow 3, sub-state
+/// (`+4`) 1 once its `SysButtonMenu` is open.
+const SHOP_MENU: u32 = 3;
+const SHOP_MENU_TAKING_TOUCHES: u32 = 1;
+
+fn shop_top_menu(env: &Environment, game: Game) -> bool {
+    if game.shop_main == 0 {
+        return false;
+    }
+    task_work(env, game, game.shop_main)
+        .is_some_and(|work| read_u32(env, work) == SHOP_MENU && read_u32(env, work + 4) == SHOP_MENU_TAKING_TOUCHES)
+}
+
+/// The password keyboard's work (`Keyboard_Main`): `+0` its state (1
+/// takes touches; others check the password or show a dialog), and the
+/// byte count of characters typed at `+0x30c` (35 at most).
+const KEYBOARD_TAKING_TOUCHES: u32 = 1;
+const KEYBOARD_TYPED: u32 = 0x30c;
+
+/// Where back taps on the shop's buy or sell list: its back icon.
+fn shop_list_back(env: &Environment, game: Game) -> Option<(f32, f32)> {
+    if game.shop_main == 0 {
+        return None;
+    }
+    let work = task_work(env, game, game.shop_main)?;
+    if !matches!(read_u32(env, work), SHOP_BUY | SHOP_SELL) {
+        return None;
+    }
+    read_prim_rect(env, game, read_u32(env, work + 0x20)).map(rect_center)
+}
+
+/// The Results screen's pearl split, while it takes touches.
+fn result_divide(env: &Environment, game: Game) -> Option<Widget> {
+    if game.result_main == 0 {
+        return None;
+    }
+    let work = task_work(env, game, game.result_main)?;
+    if read_u32(env, work) != RESULT_DIVIDE_FLOW
+        || read_u32(env, work + 4) != RESULT_DIVIDE_TAKING_TOUCHES
+    {
+        return None;
+    }
+    let count = read_u32(env, work + 0x1c) as usize;
+    if count == 0 {
+        return None;
+    }
+    let selected = read_u32(env, work + 0xc) as i32;
+    Some(Widget::Scene {
+        work: work + RESULT_DIVIDE_FLOW,
+        set: result_divide_set(count, selected),
     })
 }
 
@@ -2116,6 +2868,27 @@ const UNIT_SELECT_TAKING_TOUCHES: u32 = 1;
 /// Unit select's state while another team's unit's status is open.
 const UNIT_SELECT_STATUS: u32 = 3;
 
+/// A battle script is running (`_tactics_script_flag`): `Tactics_Main`
+/// runs the script loop instead of the phase.
+fn battle_script(env: &Environment, game: Game) -> bool {
+    game.script_flag != 0 && read_u32(env, game.script_flag) != 0
+}
+
+/// A message's "tap to continue" mark shows (`SysMessageKeyMark`: its
+/// `SysAnim` id at `_mesmanage + 0x0`, enabled at `+0x4`).
+fn message_waiting(env: &Environment, game: Game) -> bool {
+    if game.mesmanage == 0 || game.anim_work == 0 {
+        return false;
+    }
+    let id = read_u32(env, game.mesmanage) as i32;
+    let enabled = read_u32(env, game.mesmanage + 4) == 1;
+    let slot = |offset: u32| match u32::try_from(id) {
+        Ok(id) if id < 512 => read_u32(env, game.anim_work + id * 0x5c + offset),
+        _ => 0,
+    };
+    enabled && battle::anim_visible(id, slot(0), slot(0xc))
+}
+
 /// A tutorial is showing over the battle; `Tactics_Main` skips the phase
 /// while it does, and it takes a tap anywhere.
 fn battle_tutorial(env: &Environment, game: Game) -> bool {
@@ -2137,29 +2910,37 @@ fn selected_unit_tile(env: &Environment, game: Game) -> Option<Tile> {
     })
 }
 
-/// Unit select (phase 19): the D-pad moves touchHLE's tile cursor along
-/// the grid, panning the map to keep it holdable; confirm holds a finger
-/// on its tile (which acts on its unit at once, see battle::holdable), the
-/// shoulders tap the curved arrows and Start taps MENU. Returns the
-/// outline (the cursor's tile).
+/// Unit select (phase 19), on a held finger like move select (the user's
+/// choice, 2026-09-28): a finger rests on the cursor's tile, so the game
+/// draws its own cursor there (under the units) and its status panel shows
+/// the unit under it. The D-pad slides it along the grid (panning when a
+/// tile is out of the finger's reach), confirm lets go (acting on the tile
+/// as a tap would: the game picks a held finger's unit by tile, a tap's by
+/// sprite, see battle::holdable), and the shoulders (the curved arrows),
+/// Start (MENU) and the triggers (zoom) first let go on a tile with no unit,
+/// which does nothing. Too low to hold (the map's bottom rows), the cursor
+/// is touchHLE's diamond and confirm taps a unit there.
 ///
 /// Everything waits while the game isn't taking touches (unit select's own
-/// state isn't 1, an animation) or the camera is moving, so taps land on
-/// what the player saw.
-fn unit_select(
-    env: &mut Environment,
-    game: Game,
-    battle: &Battle,
-) -> Option<(f32, f32, f32, f32)> {
+/// state isn't 1, an animation), the camera is moving or a zoom animates,
+/// so touches land on what the player saw.
+fn unit_select(env: &mut Environment, game: Game, battle: &Battle) -> Option<FocusMarker> {
     use battle::UnitSelectIntent as Intent;
 
-    // State 3: another team's unit's status is open (after tapping it).
-    // A still tap at x < 160 (the stats panel) flips its page, one further
-    // right closes it; the finger must go down and up on the same side.
-    if read_u32(env, game.unit_select) == UNIT_SELECT_STATUS {
-        // Here confirm closes it too: an enemy's status is only a glance.
+    // The finger rests only while the controller is in use: a real touch
+    // takes over (touch_used), and the next button press brings it back.
+    if !env.framework_state.song_summoner.game_input.pad_mode {
+        return None;
+    }
+
+    let select_state = read_u32(env, game.unit_select);
+    // State 3: another team's unit's status is open (after letting go on
+    // one). A still tap at x < 160 (the stats panel) flips its page, one
+    // further right closes it; the finger must go down and up on the same
+    // side. Here confirm closes it too: an enemy's status is only a glance.
+    if select_state == UNIT_SELECT_STATUS {
         let state = &mut env.framework_state.song_summoner.game_input;
-        if state.taps.is_idle() {
+        if state.taps.is_idle() && state.finger.finger().is_none() {
             if let Some(role) = state.commands.pop_front() {
                 let role = if role == Role::Confirm { Role::Back } else { role };
                 if let Some((x, y)) = battle::status_command(role) {
@@ -2169,139 +2950,183 @@ fn unit_select(
         }
         return None;
     }
-    let select_state = read_u32(env, game.unit_select);
-    let taking_touches = select_state == UNIT_SELECT_TAKING_TOUCHES;
-    let menu_rect = read_prim_rect(env, game, read_u32(env, game.unit_select + 0x24));
-    let selected = selected_unit_tile(env, game).filter(|&t| battle.grid.contains(t));
+    let taking = select_state == UNIT_SELECT_TAKING_TOUCHES;
+    let menu = read_prim_rect(env, game, read_u32(env, game.unit_select + 0x24)).map(rect_center);
+    let camera = battle.camera;
+    let grid = &battle.grid;
+    // Letting go on a unit acts (selects it, opens its ring or status);
+    // anywhere else the game's cursor just goes back to the selected unit.
+    let units: Vec<Tile> = grid.tiles().filter(|&t| grid.unit_at(t).is_some()).collect();
+    let game_cursor = Some(battle.cursor).filter(|&t| grid.contains(t));
+
     let state = &mut env.framework_state.song_summoner.game_input;
+    let still = state.battle_input.origin == Some(camera.origin);
+    state.battle_input.origin = Some(camera.origin);
+    let zoom = take_zoom(&mut state.commands, battle, state.battle_input.zoom);
+    state.battle_input.zoom = zoom;
+    let idle = state.taps.is_idle() && state.finger.is_idle();
+    let finger = state.finger.finger();
+    let input = &mut state.battle_input;
 
-    let origin = battle.camera.origin;
-    let still = state.battle_origin == Some(origin);
-    state.battle_origin = Some(origin);
-
-    // Follow the game's cursor when the game moves it (the arrows, a
-    // selection), but not while our own pan or hold moves it (a held
-    // finger drags it along; a release puts it back on the selected unit).
-    let game_cursor = Some(battle.cursor).filter(|&t| battle.grid.contains(t));
-    if state.battle_touching {
-        if state.taps.is_idle() {
-            state.battle_touching = false;
-            state.battle_seen = game_cursor;
-        }
-    } else if game_cursor.is_some() && game_cursor != state.battle_seen {
-        state.battle_seen = game_cursor;
-        state.battle_cursor = game_cursor.map(|t| (battle.work, t));
+    // Follow the game's cursor when the game moves it, but not while our
+    // finger is down (the game's cursor follows the finger) or just after
+    // our own lift or pan.
+    if finger.is_some() || !idle {
+        input.seen = game_cursor;
+    } else if std::mem::take(&mut input.ours) {
+        input.seen = game_cursor;
+    } else if game_cursor.is_some() && game_cursor != input.seen {
+        input.seen = game_cursor;
+        input.cursor = game_cursor;
     }
-    let mut cursor = match state.battle_cursor {
-        Some((work, tile)) if work == battle.work && battle.grid.contains(tile) => tile,
-        _ => game_cursor
-            .or(selected)
-            .unwrap_or((battle.grid.w / 2, battle.grid.h / 2)),
+    let mut cursor = input
+        .cursor
+        .filter(|&t| grid.contains(t))
+        .or(game_cursor)
+        .unwrap_or((grid.w / 2, grid.h / 2));
+
+    let ready = taking && still && !battle.zooming && idle;
+    let reason = (!ready).then(|| {
+        format!(
+            "state {}, camera still {}, zooming {}, finger or tap under way {}",
+            select_state, still, battle.zooming, !idle
+        )
+    });
+    log_waiting(state, "unit select", reason);
+    let input = &mut state.battle_input;
+    if !ready {
+        input.cursor = Some(cursor);
+        let stuck = state.battle_input.last_pan == Some(camera.origin);
+        return diamond(
+            &camera,
+            &state.finger,
+            cursor,
+            battle::UNIT_SELECT_HOLD,
+            stuck,
+            &mut state.clean_look,
+        );
+    }
+
+    while let Some(role) = state.commands.pop_front() {
+        match battle::unit_select_intent(role) {
+            Intent::Move(dir) => {
+                cursor = battle::grid_step(grid, cursor, dir);
+                input.act = false;
+            }
+            Intent::Confirm => {
+                input.act = true;
+                break;
+            }
+            Intent::PrevUnit => {
+                input.pending_tap = Some(battle::PREV_UNIT_ARROW);
+                break;
+            }
+            Intent::NextUnit => {
+                input.pending_tap = Some(battle::NEXT_UNIT_ARROW);
+                break;
+            }
+            Intent::Menu => {
+                input.pending_tap = menu;
+                break;
+            }
+            Intent::None => {}
+        }
+    }
+
+    let view = battle::FollowView {
+        camera: &camera,
+        grid,
+        accepted: &units,
+        cursor: Some(cursor),
+        finger,
+        want_down: input.pending_tap.is_none() && input.zoom.is_none(),
+        act: input.act,
+        last_pan: input.last_pan,
+        hold_area: battle::UNIT_SELECT_HOLD,
+        harmless_area: battle::TAP_AREA,
     };
-
-    // Say why presses are waiting, once per reason, so a wrong guess about
-    // the game shows up in the log rather than as a dead controller.
-    let waiting = (!state.commands.is_empty()).then_some((
-        select_state,
-        still,
-        state.taps.is_idle(),
-    ));
-    if waiting != state.battle_waiting {
-        if let Some((select_state, still, idle)) = waiting {
-            if !(taking_touches && still && idle) {
+    let mut zoom_now = None;
+    match battle::follow(&view) {
+        battle::FollowAction::Wait => {
+            // The finger is up as wanted: the arrows' or MENU's tap, or the
+            // zoom.
+            if finger.is_none() {
+                if let Some((x, y)) = input.pending_tap.take() {
+                    log!("input: unit select, tapping {:?}", (x, y));
+                    state.taps.tap(x, y);
+                } else {
+                    zoom_now = input.zoom.take();
+                }
+            }
+        }
+        battle::FollowAction::Press((x, y)) => {
+            log!("input: unit select, pressing on tile {:?} at {:?}", cursor, (x, y));
+            input.last_pan = None;
+            state.finger.press(x, y);
+        }
+        battle::FollowAction::Slide((x, y)) => {
+            log!("input: unit select, sliding to tile {:?} at {:?}", cursor, (x, y));
+            state.finger.slide_to(x, y);
+        }
+        battle::FollowAction::Lift => {
+            log!(
+                "input: unit select, letting go on tile {:?} (unit {:?}, acting {})",
+                cursor,
+                grid.unit_at(cursor),
+                input.act
+            );
+            input.act = false;
+            input.ours = true;
+            state.finger.lift();
+        }
+        battle::FollowAction::LiftAt((x, y)) => {
+            log!(
+                "input: unit select, letting go where nothing happens: tile {:?} at {:?}",
+                camera.hold_tile_at((x, y)),
+                (x, y)
+            );
+            input.ours = true;
+            state.finger.slide_to(x, y);
+            state.finger.lift();
+        }
+        battle::FollowAction::Pan(dx, dy) => {
+            log!("input: unit select, panning by {:?} toward tile {:?}", (dx, dy), cursor);
+            input.ours = true;
+            input.last_pan = Some(camera.origin);
+            let (x, y) = battle::TAP_CENTRE;
+            state.taps.push(Gesture::Pan { x, y, dx, dy });
+        }
+        battle::FollowAction::Tap((x, y)) => {
+            input.act = false;
+            // Only a unit can be picked by a tap; on empty ground it shows
+            // nothing.
+            if battle::confirm_picks(grid, cursor) {
                 log!(
-                    "input: unit select, presses waiting (state {}, camera still {}, no tap under way {})",
-                    select_state,
-                    still,
-                    idle
+                    "input: unit select, tapping tile {:?} at {:?} (too low to hold)",
+                    cursor,
+                    (x, y)
                 );
+                state.taps.tap(x, y);
             }
         }
-        state.battle_waiting = waiting;
-    }
-
-    if taking_touches && still && state.taps.is_idle() {
-        while let Some(role) = state.commands.pop_front() {
-            match battle::unit_select_intent(role) {
-                Intent::Move(dir) => {
-                    cursor = battle::grid_step(&battle.grid, cursor, dir);
-                    state.battle_confirm = false;
-                    state.battle_pan = None;
-                }
-                Intent::Confirm => state.battle_confirm = true,
-                Intent::PrevUnit => {
-                    let (x, y) = battle::PREV_UNIT_ARROW;
-                    state.taps.tap(x, y);
-                    break;
-                }
-                Intent::NextUnit => {
-                    let (x, y) = battle::NEXT_UNIT_ARROW;
-                    state.taps.tap(x, y);
-                    break;
-                }
-                Intent::Menu => {
-                    if let Some(rect) = menu_rect {
-                        let (x, y) = rect_center(rect);
-                        state.taps.tap(x, y);
-                    }
-                    break;
-                }
-                Intent::None => {}
-            }
-        }
-        // Bring the cursor's tile where a held finger reaches it, then
-        // hold it if asked to. A hold rather than a tap: the game picks a
-        // held finger's unit by tile, a tap's by sprite (battle::holdable).
-        let centre = battle.camera.tile_centre(cursor);
-        let pan = battle::pan_toward(&battle.camera, cursor, state.battle_pan);
-        if state.taps.is_idle() {
-            if battle::holdable(centre) {
-                state.battle_pan = None;
-                // Any tile, as a finger would: the game's cursor goes
-                // there and the status panel shows its unit or hides.
-                if std::mem::take(&mut state.battle_confirm) {
-                    let (x, y) = battle.camera.hold_point(cursor);
-                    log!(
-                        "input: unit select, holding tile {:?} at {:?} (game cursor on {:?}, confirm still down {})",
-                        cursor,
-                        (x, y),
-                        battle.cursor,
-                        state.confirm_down
-                    );
-                    // The game's cursor follows the finger, and goes back to
-                    // the selected unit after a hold on an empty tile; ours
-                    // stays put.
-                    state.battle_touching = true;
-                    // Down while confirm is held (the game's cursor and
-                    // status panel show the unit), at least long enough
-                    // to be a hold; letting go acts.
-                    let frames = battle::SELECT_HOLD_FRAMES;
-                    state.taps.push(Gesture::Hold { x, y, frames });
-                    state.taps.keep_down(state.confirm_down);
-                }
-            } else if let Some((dx, dy)) = pan {
-                log!("input: unit select, panning by {:?} toward tile {:?}", (dx, dy), cursor);
-                state.battle_pan = Some(origin);
-                state.battle_touching = true;
-                let (x, y) = battle::TAP_CENTRE;
-                state.taps.push(Gesture::Pan { x, y, dx, dy });
-            } else if battle::tappable(centre)
-                && std::mem::take(&mut state.battle_confirm)
-                && battle::confirm_picks(&battle.grid, cursor)
-            {
-                // At the map's bottom edge, too low for a held finger: a
-                // tap is the only way left (a unit drawn over this tile
-                // may take it).
-                log!("input: unit select, tapping tile {:?} at {:?} (too low to hold)", cursor, centre);
-                state.taps.tap(centre.0, centre.1);
-            } else {
-                // It can't be brought any closer (the map's edge).
-                state.battle_confirm = false;
-            }
+        battle::FollowAction::Stuck => {
+            input.act = false;
         }
     }
-    state.battle_cursor = Some((battle.work, cursor));
-    Some(battle.camera.tile_rect(cursor))
+    input.cursor = Some(cursor);
+    let stuck = state.battle_input.last_pan == Some(camera.origin);
+    let outline = diamond(
+        &camera,
+        &state.finger,
+        cursor,
+        battle::UNIT_SELECT_HOLD,
+        stuck,
+        &mut state.clean_look,
+    );
+    if let Some(percent) = zoom_now {
+        apply_zoom(env, game, percent);
+    }
+    outline
 }
 
 /// Draw every map tile's outline over battle (debug builds), to check
@@ -2379,7 +3204,7 @@ fn battle_debug(env: &mut Environment, game: Game, main_view: id) {
     }
     log_battle_targets(env, game, &battle);
 
-    if !DRAW_TILE_GRID {
+    if !(DRAW_TILE_GRID || env.options.controller_debug) {
         clear_battle_overlay(env);
         return;
     }
@@ -2529,7 +3354,17 @@ fn open_widgets(env: &Environment, game: Game) -> Vec<Widget> {
             continue;
         }
         if main == game.list_menu_main {
-            widgets.extend(read_list(env, work).map(Widget::List));
+            widgets.extend(read_list(env, game.prim_work, work).map(Widget::List));
+            continue;
+        }
+        if game.keyboard_main != 0 && main == game.keyboard_main {
+            if read_u32(env, work) == KEYBOARD_TAKING_TOUCHES {
+                let typed = env.mem.read(ConstPtr::<u8>::from_bits(work + KEYBOARD_TYPED));
+                widgets.push(Widget::Keyboard {
+                    work,
+                    typed: usize::from(typed),
+                });
+            }
             continue;
         }
         if main != game.button_menu_main || read_u32(env, work) != MENU_ACCEPTING {
@@ -2572,17 +3407,131 @@ fn open_widgets(env: &Environment, game: Game) -> Vec<Widget> {
     if widgets.is_empty() {
         widgets.extend(scene(false));
     }
+    // The shop's buy and sell lists go back by its back icon.
+    if let Some(back) = shop_list_back(env, game) {
+        for widget in &mut widgets {
+            if let Widget::List(list) = widget {
+                list.back = back;
+            }
+        }
+    }
+    if widgets.is_empty() {
+        widgets.extend(result_divide(env, game));
+    }
     if widgets.is_empty() {
         widgets.extend(world_map(env, game).map(Widget::World));
     }
     widgets
 }
 
-/// A controller button that the picker didn't take.
-pub fn handle_pad_button(env: &mut Environment, button: PadButton, pressed: bool) {
-    let Some(role) = pad::role(button, env.options.confirm_button) else {
-        return;
+/// A key on a real keyboard (desktop), before its mapping: while the
+/// password keyboard is up, letters, digits, Backspace and Return type on
+/// it ([typed_key]). Returns true if it took the key (press and release).
+pub fn handle_typing(env: &mut Environment, key: &str, pressed: bool) -> bool {
+    if !super::setup::device_keyboard(env) {
+        return false;
+    }
+    let state = &mut env.framework_state.song_summoner.game_input;
+    if !state.password_keyboard {
+        return false;
+    }
+    // The on-screen keyboard's text input is on (Android): its text
+    // events type, so the key itself mustn't too.
+    if state.soft_keyboard {
+        return false;
+    }
+    let Some(typed) = typed_key(key) else {
+        return false;
     };
+    // A few ahead at most, like the pad's commands.
+    if pressed && state.typed_keys.len() < 8 {
+        state.typed_keys.push_back(typed);
+    }
+    true
+}
+
+/// Text from Android's on-screen keyboard (SDL text input), while it's up
+/// for the password keyboard: each character it types, Backspace and
+/// Return, the same as [typed_key]. Returns true if it took the event.
+pub fn handle_text(env: &mut Environment, event: &crate::window::TextInputEvent) -> bool {
+    use crate::window::TextInputEvent;
+    if super::setup::is_open(env) {
+        return false;
+    }
+    let state = &mut env.framework_state.song_summoner.game_input;
+    if !state.soft_keyboard {
+        return false;
+    }
+    let keys: Vec<u8> = match event {
+        TextInputEvent::Backspace => vec![KEY_BACKSPACE],
+        TextInputEvent::Return => vec![KEY_ENTER],
+        TextInputEvent::Text(text) => text
+            .chars()
+            .filter_map(|c| typed_key(&c.to_ascii_uppercase().to_string()))
+            .collect(),
+    };
+    for key in keys {
+        if state.typed_keys.len() < 8 {
+            state.typed_keys.push_back(key);
+        }
+    }
+    true
+}
+
+/// The shop's top menu is up and the controller or keyboard is in use:
+/// show the Password pill.
+pub fn password_pill(env: &Environment) -> bool {
+    let state = &env.framework_state.song_summoner.game_input;
+    state.shop_menu && state.pad_mode
+}
+
+/// Android: show the on-screen keyboard while the password keyboard is up
+/// and the player chose to type on it; hide it after. SDL's text input,
+/// as for `UITextField`, which keeps the app focused.
+/// The Setup menu is opening: put away the on-screen keyboard, which would
+/// cover it and keep its keys from the menu. The game's next frame brings
+/// it back if the password keyboard is still up.
+pub fn hide_soft_keyboard(env: &mut Environment) {
+    let state = &mut env.framework_state.song_summoner.game_input;
+    if !std::mem::take(&mut state.soft_keyboard) {
+        return;
+    }
+    log!("input: hiding the on-screen keyboard for the Setup menu");
+    env.on_parent_stack_in_coroutine(|window, _| window.stop_text_input());
+}
+
+fn update_soft_keyboard(env: &mut Environment) {
+    if !cfg!(target_os = "android") {
+        return;
+    }
+    let want = env.framework_state.song_summoner.game_input.password_keyboard
+        && super::setup::device_keyboard(env);
+    let state = &mut env.framework_state.song_summoner.game_input;
+    if want == state.soft_keyboard {
+        return;
+    }
+    state.soft_keyboard = want;
+    log!("input: {} the on-screen keyboard", if want { "showing" } else { "hiding" });
+    env.on_parent_stack_in_coroutine(move |window, _| {
+        if want {
+            window.start_text_input();
+        } else {
+            window.stop_text_input();
+        }
+    });
+}
+
+/// The Setup menu is opening and takes every release until it closes: let
+/// go of a held Confirm now, or battle's finger would stay down.
+pub fn release_held(env: &mut Environment) {
+    let state = &mut env.framework_state.song_summoner.game_input;
+    state.confirm_down = false;
+    state.taps.keep_down(false);
+}
+
+/// A controller button or key (already mapped to its command) that the
+/// picker didn't take.
+pub fn handle_role(env: &mut Environment, role: Role, pressed: bool) {
     let state = &mut env.framework_state.song_summoner.game_input;
     // Battle's confirm holds a finger down for as long as it's held.
     if role == Role::Confirm {
@@ -2609,9 +3558,12 @@ pub fn handle_pad_button(env: &mut Environment, button: PadButton, pressed: bool
 
 /// A finger touched the screen: hide the controller's focus.
 pub fn touch_used(env: &mut Environment) {
+    // A real finger takes over from the held virtual one. This runs before
+    // the game hears of the touch, so its touch state is clear by then.
+    if let Some(game) = game(env) {
+        drop_finger(env, game, "a real touch");
+    }
     let state = &mut env.framework_state.song_summoner.game_input;
-    // A real finger takes over from the held virtual one.
-    state.finger.clear();
     if state.pad_mode {
         state.pad_mode = false;
         if let Some(window) = env.window.as_mut() {
@@ -2620,8 +3572,20 @@ pub fn touch_used(env: &mut Environment) {
     }
 }
 
-/// A battle phase's sub-phase while it runs (`Tactics_Set_PhaseSub`: 0x66
-/// starts a phase, 0x65 runs it).
+/// Drop the held virtual finger. If the game has it down, clear the game's
+/// touch state too (`SysTouch_Clear`): `SysTouch_Began_F1` adds to a finger
+/// count that only a finger-up or a clear resets, so the next finger, a real
+/// one included, would be a second one (a pinch). A finger-up instead would
+/// act (letting go on a unit opens its ring).
+fn drop_finger(env: &mut Environment, game: Game, why: &str) {
+    if env.framework_state.song_summoner.game_input.finger.clear() {
+        log!("input: battle, dropping the held finger ({})", why);
+        () = game.touch_clear.call_from_host(env, ());
+    }
+}
+
+/// A battle phase's sub-phase while it runs (`Tactics_Main` calls a phase's
+/// Start in 0x64, its Main in 0x65 and its End in 0x66; seen at 0x4684).
 const PHASE_RUNNING: u32 = 0x65;
 /// The command ring's screen (`_tacticsunitmenu_work + 0x0`,
 /// `TacticsUnitMenu_Main`'s switch at 0x1de6c): the ring itself, the skill
@@ -2711,12 +3675,18 @@ fn run_commands(env: &mut Environment, game: Game) -> Option<FocusMarker> {
             // list, Options) and tutorials win. The deploy's card list is
             // one of its own screens, not over the map.
             let over_map = widgets.iter().any(|w| !matches!(w, Widget::Cards { .. }));
+            let script = battle_script(env, game);
+            let message = message_waiting(env, game);
+            let owner = battle::owner_now(battle.phase, script, message);
             if battle_tutorial(env, game) {
-                stand_down(env, "a tutorial");
+                stand_down(env, game, "a tutorial");
+            } else if script || message {
+                // The script's text takes a tap anywhere (menu_commands).
+                stand_down(env, game, "a script's message");
             } else if over_map {
-                stand_down(env, "a menu");
+                stand_down(env, game, "a menu");
             } else if let Battled::Done(marker) =
-                battle_commands(env, game, &battle, !widgets.is_empty())
+                battle_commands(env, game, &battle, owner, !widgets.is_empty())
             {
                 // No menu is open, so the next one is new.
                 let state = &mut env.framework_state.song_summoner.game_input;
@@ -2735,58 +3705,52 @@ fn run_commands(env: &mut Environment, game: Game) -> Option<FocusMarker> {
             let state = &mut env.framework_state.song_summoner.game_input;
             if state.battle_input.phase.is_some() {
                 state.battle_input = BattleInput::default();
-                state.finger.clear();
+                drop_finger(env, game, "left battle");
             }
         }
     }
-    menu_commands(env, game, widgets).map(|r| (r, FocusShape::Brackets))
+    menu_commands(env, game, widgets)
 }
 
-/// Start the battle handlers afresh when the phase changes: a pending
-/// confirm or pan, the held finger and the cursors belong to the last one.
+/// Start the battle handlers afresh when the phase changes: the held
+/// finger, the cursor and anything pending belong to the last one.
 fn track_battle_phase(env: &mut Environment, game: Game, battle: &Battle) {
     let key = (battle.work, battle.phase);
     if env.framework_state.song_summoner.game_input.battle_input.phase == Some(key) {
         return;
     }
     let selected = selected_unit_tile(env, game);
+    drop_finger(env, game, "the phase changed");
     let state = &mut env.framework_state.song_summoner.game_input;
+    let after_turn_script = state.battle_input.phase == Some((battle.work, 18));
     log!(
         "input: battle phase {} ({}), controller: {:?}",
         battle.phase,
         battle::phase_name(battle.phase),
         battle::phase_owner(battle.phase)
     );
-    if state.finger.is_down() || !state.finger.is_idle() {
-        log!("input: battle, dropping the held finger (the phase changed)");
-    }
-    state.finger.clear();
+    // Unit select starts on the selected unit: after a unit's turn ends,
+    // that's the next one, not where the cursor was. But when a team's
+    // turn starts (after the turn script), it's the game's cursor: the
+    // selected unit is still the other team's last. The game's cursor is
+    // followed from where it is now.
     state.battle_input = BattleInput {
         phase: Some(key),
+        cursor: (battle.phase == 19)
+            .then(|| battle::unit_select_start(&battle.grid, selected, battle.cursor, after_turn_script)),
+        seen: Some(battle.cursor),
         ..BattleInput::default()
     };
-    state.battle_confirm = false;
-    state.battle_pan = None;
-    // Unit select starts on the selected unit: after a turn ends, that's
-    // the next one, not where the cursor was. Our own hold (which opened
-    // the ring) is over, so the game's cursor is followed again from here.
-    state.battle_touching = false;
-    state.battle_seen = Some(battle.cursor);
-    state.battle_cursor = (battle.phase == 19).then(|| {
-        (battle.work, battle::unit_select_start(&battle.grid, selected, battle.cursor))
-    });
 }
 
 /// Start a handler's own screen afresh (the ring's state, the deploy's)
 /// when it changes.
-fn enter_screen(state: &mut State, screen: u32) {
-    if state.battle_input.screen == Some(screen) {
+fn enter_screen(env: &mut Environment, game: Game, screen: u32) {
+    if env.framework_state.song_summoner.game_input.battle_input.screen == Some(screen) {
         return;
     }
-    if state.finger.is_down() || !state.finger.is_idle() {
-        log!("input: battle, dropping the held finger (screen {} now)", screen);
-        state.finger.clear();
-    }
+    drop_finger(env, game, &format!("screen {screen} now"));
+    let state = &mut env.framework_state.song_summoner.game_input;
     state.battle_input = BattleInput {
         phase: state.battle_input.phase,
         screen: Some(screen),
@@ -2796,13 +3760,9 @@ fn enter_screen(state: &mut State, screen: u32) {
 
 /// Something is over the map: the battle handlers stand down, and a held
 /// finger goes (its lift would be what advances a tutorial).
-fn stand_down(env: &mut Environment, what: &str) {
-    let state = &mut env.framework_state.song_summoner.game_input;
-    if state.finger.is_down() || !state.finger.is_idle() {
-        log!("input: battle, {} over the map: dropping the held finger", what);
-        state.finger.clear();
-    }
-    state.battle_input.act = false;
+fn stand_down(env: &mut Environment, game: Game, what: &str) {
+    drop_finger(env, game, &format!("{what} over the map"));
+    env.framework_state.song_summoner.game_input.battle_input.act = false;
 }
 
 /// Log, once per change, why queued presses are waiting in a battle
@@ -2852,17 +3812,17 @@ fn apply_zoom(env: &mut Environment, game: Game, percent: i32) {
     () = set_zoom.call_from_host(env, (percent, ZOOM_FRAMES, ZOOM_MODE));
 }
 
-/// Battle's own screens, by phase (battle::phase_owner). `widgets_open`:
+/// Battle's own screens, by `owner` (battle::owner_now). `widgets_open`:
 /// something the menus handle is up (only the deploy's card list, since
 /// anything over the map was dealt with before).
 fn battle_commands(
     env: &mut Environment,
     game: Game,
     battle: &Battle,
+    owner: battle::Owner,
     widgets_open: bool,
 ) -> Battled {
     use battle::Owner;
-    let owner = battle::phase_owner(battle.phase);
     let state = &mut env.framework_state.song_summoner.game_input;
     // The triggers only zoom in unit, move and attack select.
     if !matches!(owner, Owner::UnitSelect | Owner::MoveSelect | Owner::AttackSelect) {
@@ -2873,28 +3833,7 @@ fn battle_commands(
             if battle.sub != PHASE_RUNNING {
                 return Battled::Done(None);
             }
-            // A zoom goes before unit select sees the queue, once nothing
-            // is under way.
-            let zoom = take_zoom(&mut state.commands, battle, state.battle_input.zoom);
-            state.battle_input.zoom = zoom;
-            if battle.zooming {
-                // Tactics_Main skips the phase while the zoom animates;
-                // the tiles are on the move, so pans and holds wait.
-                let outline = state
-                    .battle_cursor
-                    .map(|(_, tile)| (battle.camera.tile_rect(tile), FocusShape::Diamond));
-                return Battled::Done(outline);
-            }
-            let idle = state.taps.is_idle();
-            let taking = read_u32(env, game.unit_select) == UNIT_SELECT_TAKING_TOUCHES;
-            if taking && idle {
-                let state = &mut env.framework_state.song_summoner.game_input;
-                if let Some(percent) = state.battle_input.zoom.take() {
-                    apply_zoom(env, game, percent);
-                    return Battled::Done(None);
-                }
-            }
-            Battled::Done(unit_select(env, game, battle).map(|r| (r, FocusShape::Diamond)))
+            Battled::Done(unit_select(env, game, battle))
         }
         Owner::Ring if !widgets_open && game.unit_menu_work != 0 => {
             Battled::Done(ring_commands(env, game, battle))
@@ -2937,8 +3876,8 @@ fn status_commands(state: &mut State) {
 /// The command ring (phase 20) and the screens it opens.
 fn ring_commands(env: &mut Environment, game: Game, battle: &Battle) -> Option<FocusMarker> {
     let screen = read_u32(env, game.unit_menu_work);
+    enter_screen(env, game, screen);
     let state = &mut env.framework_state.song_summoner.game_input;
-    enter_screen(state, screen);
     match screen {
         RING_TOP => ring_top(env, game, battle),
         RING_SKILL => skill_panel(env, game, battle),
@@ -3072,6 +4011,10 @@ fn ring_top(env: &mut Environment, game: Game, battle: &Battle) -> Option<FocusM
 /// the finger goes down again), back slides off the list and lets go
 /// (which does nothing), then taps the map side, which closes the panel.
 fn skill_panel(env: &mut Environment, game: Game, battle: &Battle) -> Option<FocusMarker> {
+    // Only while the controller is in use, as in unit select.
+    if !env.framework_state.song_summoner.game_input.pad_mode {
+        return None;
+    }
     let sub = read_u32(env, game.unit_menu_work + 4);
     let count = if game.status_work != 0 {
         read_u32(env, game.status_work + 0x24).min(64) as usize
@@ -3240,6 +4183,10 @@ fn locked_select(
     battle: &Battle,
     kind: Locked,
 ) -> Option<FocusMarker> {
+    // Only while the controller is in use, as in unit select.
+    if !env.framework_state.song_summoner.game_input.pad_mode {
+        return None;
+    }
     // The game's side: whether it takes touches, the tiles where letting
     // go acts, the unit's own tile (where move select's cursor starts,
     // and back returns to), where the cursor starts, and attack select's
@@ -3308,7 +4255,9 @@ fn locked_select(
     }
     if !ready {
         state.battle_input.cursor = cursor;
-        return cursor.map(|c| (camera.tile_rect(c), FocusShape::Diamond));
+        let stuck = state.battle_input.last_pan == Some(camera.origin);
+        let clean = &mut state.clean_look;
+        return cursor.and_then(|c| diamond(&camera, &state.finger, c, battle::WHOLE_SCREEN, stuck, clean));
     }
 
     while let Some(role) = state.commands.pop_front() {
@@ -3359,6 +4308,8 @@ fn locked_select(
         want_down: !input.back_tap && input.zoom.is_none(),
         act: input.act,
         last_pan: input.last_pan,
+        hold_area: battle::WHOLE_SCREEN,
+        harmless_area: battle::HARMLESS_AREA,
     };
     let mut zoom_now = None;
     match battle::follow(&view) {
@@ -3438,10 +4389,35 @@ fn locked_select(
         }
     }
     input.cursor = cursor;
+    let stuck = state.battle_input.last_pan == Some(camera.origin);
+    let clean = &mut state.clean_look;
+    let outline = cursor.and_then(|c| diamond(&camera, &state.finger, c, battle::WHOLE_SCREEN, stuck, clean));
     if let Some(percent) = zoom_now {
         apply_zoom(env, game, percent);
     }
-    cursor.map(|c| (camera.tile_rect(c), FocusShape::Diamond))
+    outline
+}
+
+/// touchHLE's diamond on the cursor's tile, unless the finger is held
+/// there: then the game draws its own cursor, under the units. The play
+/// look shows it only where the game can't show its own: see
+/// [diamond_look].
+fn diamond(
+    camera: &Camera,
+    finger: &Finger,
+    cursor: Tile,
+    hold_area: battle::Rect,
+    stuck: bool,
+    clean: &mut Clean,
+) -> Option<FocusMarker> {
+    let holdable = battle::holdable_in(camera.tile_centre(cursor), hold_area);
+    *clean = diamond_look(holdable, stuck);
+    let under_finger = finger.finger().map(|p| camera.hold_tile_at(p)) == Some(cursor);
+    if finger.held() && under_finger {
+        None
+    } else {
+        Some((camera.tile_rect(cursor), FocusShape::Diamond))
+    }
 }
 
 /// Attack info (phase 25): confirm attacks, back returns to attack
@@ -3495,7 +4471,7 @@ fn sortie_commands(env: &mut Environment, game: Game, battle: &Battle) -> Battle
     let work = game.sortie_work;
     let screen = read_u32(env, work);
     let sub = read_u32(env, work + 4);
-    enter_screen(&mut env.framework_state.song_summoner.game_input, screen);
+    enter_screen(env, game, screen);
     match screen {
         SORTIE_PLACING => Battled::Done(locked_select(env, game, battle, Locked::Place)),
         SORTIE_SORT => Battled::Done(sort_panel(env, game, sub)),
@@ -3528,6 +4504,9 @@ fn sort_panel(env: &mut Environment, game: Game, sub: u32) -> Option<FocusMarker
         }
     }
     state.battle_input.sort_row = index;
+    if let Some(&row) = set.rects.get(index) {
+        env.framework_state.song_summoner.game_input.clean_look = Clean::HighlightAt(button_art(row));
+    }
     set.rects.get(index).map(|&r| (r, FocusShape::Brackets))
 }
 
@@ -3678,15 +4657,32 @@ fn menu_commands(
     env: &mut Environment,
     game: Game,
     widgets: Vec<Widget>,
-) -> Option<(f32, f32, f32, f32)> {
+) -> Option<FocusMarker> {
+    let brackets = |rect: (f32, f32, f32, f32)| (rect, FocusShape::Brackets);
     // A cutscene's SKIP, or the Listening Point scene's.
     let skip_shown = (game.skip_able != 0
         && env.mem.read(ConstPtr::<u8>::from_bits(game.skip_able)) != 0)
         || listening_point_skip(env, game);
+    log_list_drag(env, game, &widgets);
+    let widgets = without_captions(widgets);
+    let dial = read_dial(env, game);
+    let shop_menu = shop_top_menu(env, game);
     let state = &mut env.framework_state.song_summoner.game_input;
-    // Not in unit select: its pending confirm and pan are void.
-    state.battle_confirm = false;
-    state.battle_pan = None;
+    // Set again below while the password keyboard is up; typing waits
+    // for nothing else.
+    let keyboard_was_up = std::mem::take(&mut state.password_keyboard);
+    // The shop's top menu: Info taps the password spot.
+    state.shop_menu = shop_menu;
+    if shop_menu && state.commands.contains(&Role::Info) {
+        state.commands.retain(|&role| role != Role::Info);
+        if state.taps.is_idle() {
+            log!("input: shop, opening the password entry");
+            state.taps.tap(SHOP_PASSWORD_TAP.0, SHOP_PASSWORD_TAP.1);
+        }
+    }
+    if dial.is_none() {
+        state.dial = None;
+    }
 
     // Start taps the cutscene's SKIP button, whatever else is up (the
     // cutscene's text box isn't a menu). The "Skip?" dialog it opens is an
@@ -3713,6 +4709,7 @@ fn menu_commands(
                 Widget::Cards { .. } => "card list",
                 Widget::List(_) => "list",
                 Widget::World(_) => "world map",
+                Widget::Keyboard { .. } => "keyboard",
             })
             .collect();
         log!("input: menus open: {:?}", kinds);
@@ -3725,6 +4722,19 @@ fn menu_commands(
         .as_ref()
         .is_some_and(|w| !state.known_menus.contains(&w.work()));
     state.known_menus = open;
+
+    // The shop's quantity dial takes the focus from its Forget it/Confirm
+    // dialog, which confirm and back press (the user's choice,
+    // 2026-09-28).
+    if let Some(dial) = &dial {
+        let dialog = widgets.iter().find_map(|w| match w {
+            Widget::Dialog(dialog) => Some(dialog),
+            _ => None,
+        });
+        if let Some(dialog) = dialog {
+            return Some(dial_commands(state, dial, dialog));
+        }
+    }
 
     let Some(widget) = widget else {
         state.focus = None;
@@ -3817,6 +4827,9 @@ fn menu_commands(
                     drum.h
                 );
             }
+            Widget::Keyboard { typed, .. } => {
+                log!("input: password keyboard, {} typed", typed);
+            }
         }
     }
 
@@ -3830,7 +4843,8 @@ fn menu_commands(
         | Widget::Drum(_)
         | Widget::Cards { .. }
         | Widget::List(_)
-        | Widget::World(_) => None,
+        | Widget::World(_)
+        | Widget::Keyboard { .. } => None,
     };
     if let Some(set) = set {
         // A dialog starts on its default whenever it appears (the deploy's
@@ -3851,6 +4865,9 @@ fn menu_commands(
             // One command at a time, once the last taps have landed, so
             // each is judged against the game's selection (which a finger
             // may also have changed).
+            if appeared && state.preselected == Some(work) {
+                state.preselected = None;
+            }
             if state.taps.is_idle() {
                 index = set.selected.unwrap_or(index);
                 if let Some(role) = state.commands.pop_front() {
@@ -3859,6 +4876,14 @@ fn menu_commands(
                     for (x, y) in taps {
                         state.taps.tap(x, y);
                     }
+                } else if let Some(at) = preselect_tap(&set, index, state.pad_mode, state.preselected == Some(work)) {
+                    // Select the first item as a first tap would, so the
+                    // game shows its own highlight and description (the
+                    // user's choice, 2026-09-28). Once per opening, in
+                    // case the game won't select it.
+                    log!("input: selecting item {} to start, at {:?}", index, at);
+                    state.taps.tap(at.0, at.1);
+                    state.preselected = Some(work);
                 }
             }
             state.focus = Some((work, index));
@@ -3866,11 +4891,13 @@ fn menu_commands(
             if set.selected == Some(index) || !state.taps.is_idle() {
                 return None;
             }
-            return set.rects.get(index).copied();
+            state.clean_look = Clean::Highlight;
+            return set.rects.get(index).copied().map(brackets);
         }
         while let Some(role) = state.commands.pop_front() {
             let (new_index, tap) = button_command(&set, index, role);
             index = new_index;
+            state.pressed_at = (role == Role::Confirm && tap.is_some()).then_some(state.frame);
             if let Some((x, y)) = tap {
                 state.taps.tap(x, y);
             }
@@ -3879,10 +4906,61 @@ fn menu_commands(
         let rect = set.rects.get(index).copied();
         // Taps use the whole touch area; the outline goes around the button
         // art instead, which the touch area overhangs.
+        // No resting selected look of their own: a copy of the game's
+        // highlight, on the button's art.
+        state.clean_look = match rect {
+            Some(area) => Clean::HighlightAt(button_art(area)),
+            None => Clean::Highlight,
+        };
         if matches!(widget, Widget::Dialog(_)) {
-            return rect.map(dialog_outline);
+            // The copy goes on the button art only; the touch area reaches
+            // past it (2026-09-28 screenshot: Yes's copy overhung it).
+            if let Some(area) = rect {
+                state.clean_look = Clean::HighlightAt(dialog_button_art(area));
+            }
         }
-        return rect;
+        if just_pressed(state.pressed_at, state.frame) {
+            state.clean_look = Clean::Hide;
+        }
+        if matches!(widget, Widget::Dialog(_)) {
+            return rect.map(dialog_outline).map(brackets);
+        }
+        return rect.map(brackets);
+    }
+
+    if let &Widget::Keyboard { work, typed } = &widget {
+        let mut focus = match state.focus {
+            Some((w, i)) if w == work && i < KEYBOARD_KEYS.len() => i,
+            _ => 0,
+        };
+        state.password_keyboard = true;
+        if !keyboard_was_up {
+            state.typed_keys.clear();
+        }
+        // One key at a time: the game takes the key under the finger when
+        // it lifts, so each tap finishes before the next. Keys typed on a
+        // real keyboard go first, and move the focus to where they are.
+        if state.taps.is_idle() {
+            if let Some(i) = state.typed_keys.pop_front().and_then(key_index) {
+                focus = i;
+                let (x, y) = rect_center(key_rect(i));
+                state.taps.tap(x, y);
+            }
+        }
+        if state.taps.is_idle() {
+            while let Some(role) = state.commands.pop_front() {
+                let (new_focus, tap) = keyboard_command(focus, typed, role);
+                focus = new_focus;
+                if let Some((x, y)) = tap {
+                    state.taps.tap(x, y);
+                    break;
+                }
+            }
+        }
+        state.focus = Some((work, focus));
+        // The keys have no selected look of their own.
+        state.clean_look = Clean::Highlight;
+        return Some(brackets(key_rect(focus)));
     }
 
     if let Widget::World(map) = &widget {
@@ -3948,6 +5026,8 @@ fn menu_commands(
                 match gesture {
                     Some(Some(gesture)) => {
                         state.taps.push(gesture);
+                        // A scroll is stopped once it has gone its way.
+                        state.taps.extend(help_stop(gesture));
                         break;
                     }
                     Some(None) => {}
@@ -3961,6 +5041,7 @@ fn menu_commands(
             if !help.page && state.taps.is_idle() {
                 if let Some(drag) = help.scroll_toward(focus) {
                     state.taps.push(drag);
+                    state.taps.extend(help_stop(drag));
                 }
             }
         }
@@ -3969,7 +5050,13 @@ fn menu_commands(
         if help.page {
             return None;
         }
-        return help.rows.get(focus).copied().filter(|_| help.row_visible(focus));
+        state.clean_look = Clean::Highlight;
+        return help
+            .rows
+            .get(focus)
+            .copied()
+            .filter(|_| help.row_visible(focus))
+            .map(brackets);
     }
 
     if let Widget::Options(options) = &widget {
@@ -3991,7 +5078,8 @@ fn menu_commands(
             }
         }
         state.focus = Some((options.work, focus));
-        return rows.get(focus).copied();
+        state.clean_look = Clean::Highlight;
+        return rows.get(focus).copied().map(brackets);
     }
 
     if let Widget::List(list) = &widget {
@@ -4000,10 +5088,45 @@ fn menu_commands(
             _ => list.cursor,
         };
         state.since_drag = state.since_drag.saturating_add(1);
+        // Judge the last scroll drag once it's done and the list is still:
+        // moved, fine; not moved, this list won't scroll by a drag.
+        let judging = state.taps.is_idle() && state.since_drag > HOLD_FRAMES + 2 && list.settled;
+        // (pending: still waiting to judge it; stuck: it didn't move.)
+        let (pending, stuck) = match state.list_scroll {
+            Some((work, first, wanted_later)) if work == list.work => {
+                if !judging {
+                    (true, false)
+                } else {
+                    match judge_scroll(first, list.first, wanted_later) {
+                        ScrollOutcome::Moved => {
+                            state.list_scroll = None;
+                            (false, false)
+                        }
+                        ScrollOutcome::Still => (false, true),
+                        // Not expected with LIST_DRAG; the next drag tries
+                        // again from wherever it went.
+                        ScrollOutcome::Reversed => {
+                            log!(
+                                "input: list scrolled the wrong way for a drag (from {} to {})",
+                                first,
+                                list.first
+                            );
+                            state.list_scroll = None;
+                            (false, false)
+                        }
+                    }
+                }
+            }
+            _ => (false, false),
+        };
         if state.taps.is_idle() {
             while let Some(role) = state.commands.pop_front() {
                 let (new_focus, tap) = list_command(list, focus, role);
-                focus = new_focus;
+                focus = if stuck {
+                    list.clamp_to_shown(new_focus)
+                } else {
+                    new_focus
+                };
                 match tap {
                     Some(Some((x, y))) => {
                         state.taps.tap(x, y);
@@ -4019,19 +5142,44 @@ fn menu_commands(
             }
             // Bring the focused row on screen, a row at a time. The frames
             // after a drag let its glide register as the list's speed.
-            if state.since_drag > HOLD_FRAMES + 2 {
+            if stuck {
+                let shown = list.clamp_to_shown(focus);
+                if shown != focus {
+                    log!(
+                        "input: list didn't scroll for a drag (at {}, speed now 0), keeping the focus on row {} instead of {}",
+                        list.first,
+                        shown,
+                        focus
+                    );
+                    focus = shown;
+                }
+            } else if !pending && state.since_drag > HOLD_FRAMES + 2 {
                 if let Some(Gesture::Drag { x, y, dy }) = list.scroll_toward(focus) {
+                    log!(
+                        "input: list, dragging at {:?} by {} to scroll toward row {} (at {}, {} shown, cursor {})",
+                        (x, y),
+                        dy,
+                        focus,
+                        list.first,
+                        list.shown,
+                        list.cursor
+                    );
                     state.taps.drag(x, y, dy);
                     state.since_drag = 0;
+                    // Meant to bring on later rows (the position going up).
+                    let later = focus >= list.first.round().max(0.0) as usize;
+                    state.list_scroll = Some((list.work, list.first, later));
                 }
             }
         }
         state.focus = Some((list.work, focus));
+        // A copy of the game's own highlight (the user's choice,
+        // 2026-09-28).
         return list
             .rows
             .get(focus)
             .filter(|_| list.row_visible(focus))
-            .map(|&row| list_outline(row, list.span));
+            .and_then(|&row| list_marker(row, list.menu_x, &list.highlight));
     }
 
     if let Widget::Cards { work, list } = &widget {
@@ -4052,7 +5200,14 @@ fn menu_commands(
         }
         state.focus = Some((*work, 0));
         state.card_focus = Some(focus);
-        return Some(list.focus_rect(focus));
+        // The list centres the selected card itself; the icons below it
+        // have no selected look.
+        state.clean_look = if focus == CardFocus::Cards {
+            Clean::Hide
+        } else {
+            Clean::Highlight
+        };
+        return Some(brackets(list.focus_rect(focus)));
     }
 
     // Otherwise it's a drum, which has its own cursor.
@@ -4071,17 +5226,103 @@ fn menu_commands(
             break;
         }
     }
-    Some(drum.select_rect())
+    // Its middle band shows the choice.
+    state.clean_look = Clean::Hide;
+    Some(brackets(drum.select_rect()))
+}
+
+/// The shop's quantity dial (see [dial_command]): commands set the target
+/// digits, and the drums are flicked to them one digit at a time, each
+/// flick once they've stopped. Confirm waits until they're there.
+fn dial_commands(state: &mut State, dial: &Dial, dialog: &Dialog) -> FocusMarker {
+    let work = dial.drums[0].work;
+    if state.dial.as_ref().map(|d| d.work) != Some(work) {
+        log!(
+            "input: quantity dial, drums {:?}, digits {:?}",
+            dial.drums.iter().map(|d| d.rect).collect::<Vec<_>>(),
+            dial.digits()
+        );
+        state.dial = Some(DialState {
+            work,
+            focus: dial.drums.len() - 1,
+            target: dial.digits(),
+            bands: vec![None; dial.drums.len()],
+        });
+    }
+    let State {
+        dial: dial_state,
+        commands,
+        taps,
+        command_age,
+        ..
+    } = state;
+    let ds = dial_state.as_mut().unwrap();
+    ds.bands.resize(dial.drums.len(), None);
+    for (seen, drum) in ds.bands.iter_mut().zip(&dial.drums) {
+        if drum.band.is_some() {
+            *seen = drum.band;
+        }
+    }
+    let there = dial.settled() && dial.digits() == ds.target;
+    if taps.is_idle() {
+        while let Some(role) = commands.pop_front() {
+            let (focus, press) = dial_command(ds.focus, &mut ds.target, role);
+            ds.focus = focus.min(dial.drums.len() - 1);
+            let Some(press) = press else {
+                continue;
+            };
+            // Buy what's shown only once the drums show what was asked.
+            if press == DialPress::Confirm && !there {
+                commands.push_front(role);
+                break;
+            }
+            if let Some((x, y)) = dial_press_point(dialog, press) {
+                log!("input: quantity dial, {:?} at ({}, {})", press, x, y);
+                taps.tap(x, y);
+            }
+            break;
+        }
+    }
+    if taps.is_idle() {
+        if let Some(Gesture::Drag { x, y, dy }) = dial_step(dial, &ds.target) {
+            log!(
+                "input: quantity dial, digits {:?} toward {:?}, flicking at ({}, {}) by {}",
+                dial.digits(),
+                ds.target,
+                x,
+                y,
+                dy
+            );
+            taps.drag(x, y, dy);
+            // The dial is getting there: a confirm waiting on it isn't
+            // stale.
+            *command_age = CommandAge::default();
+        }
+    }
+    let focus = ds.focus;
+    state.focus = Some((work, focus));
+    // The band as last seen, if the game has it hidden while turning.
+    let mut shown = dial.clone();
+    if let Some(band) = state.dial.as_ref().and_then(|d| d.bands.get(focus).copied().flatten()) {
+        shown.drums[focus].band = Some(band);
+    }
+    state.clean_look = Clean::HighlightAt(shown.highlight(focus));
+    (dial.band(focus), FocusShape::Brackets)
 }
 
 /// Outline `marker` (game points) in the window's (portrait) coordinates.
 fn show_focus(env: &mut Environment, main_view: id, marker: Option<FocusMarker>) {
     let show = env.framework_state.song_summoner.game_input.pad_mode;
+    let marker = play_look(
+        marker,
+        env.framework_state.song_summoner.game_input.clean_look,
+        env.options.controller_debug,
+    );
     // A tile's diamond is drawn inside it, and a tile half off the edge is
     // better cut off than squashed, so only brackets are pulled on screen.
     let marker = marker.map(|(rect, shape)| match shape {
         FocusShape::Brackets => (keep_on_screen(rect), shape),
-        FocusShape::Diamond => (rect, shape),
+        FocusShape::Diamond | FocusShape::Highlight => (rect, shape),
     });
     let rect = match marker {
         Some(((x, y, w, h), shape)) if show => {
@@ -4138,16 +5379,28 @@ fn before_frame(env: &mut Environment, main_view: id) {
     if m_mode == 1 {
         let state = &mut env.framework_state.song_summoner.game_input;
         state.taps.clear();
-        state.finger.clear();
         state.commands.clear();
+        drop_finger(env, game, "the picker is up");
         show_focus(env, main_view, None);
         clear_battle_overlay(env);
         return;
     }
     env.framework_state.song_summoner.game_input.frame += 1;
     log_tasks(env, game);
+    let before = env.framework_state.song_summoner.game_input.commands.len();
+    env.framework_state.song_summoner.game_input.clean_look = Clean::Same;
     let focus = run_commands(env, game);
+    let state = &mut env.framework_state.song_summoner.game_input;
+    if state.command_age.stale(before, state.commands.len()) {
+        log!(
+            "input: {:?} waited {} frames unused, dropping them",
+            state.commands,
+            STALE_COMMAND_FRAMES
+        );
+        state.commands.clear();
+    }
     show_focus(env, main_view, focus);
+    update_soft_keyboard(env);
     battle_debug(env, game, main_view);
 
     // One touch call per frame: the held finger's while it's down (or
@@ -4210,6 +5463,11 @@ fn before_frame(env: &mut Environment, main_view: id) {
 /// selector with itself as the argument (`-mainLoop` ignores it). touchHLE
 /// checks host method signatures, so it has to be declared here.
 fn main_loop(env: &mut Environment, this: id, cmd: SEL, timer: id) {
+    // The Setup menu is open: the game is paused, so its frame is skipped
+    // (the menu shows its last one again).
+    if super::setup::before_frame(env) {
+        return;
+    }
     before_frame(env, this);
     match env.objc.app_override_original("MainView", "mainLoop") {
         Some(original) => {
@@ -4451,15 +5709,43 @@ mod tests {
     }
 
     #[test]
+    fn a_finger_is_held_once_the_game_calls_it_a_hold() {
+        // The game shows its cursor only once a finger is a hold, so
+        // touchHLE's cursor stays until then.
+        let mut finger = Finger::default();
+        assert!(!finger.held());
+        finger.press(1.0, 1.0);
+        finger.next_frame(); // Began
+        for _ in 0..MIN_STILL_FRAMES {
+            assert!(!finger.held());
+            finger.next_frame();
+        }
+        assert!(finger.held());
+        // Sliding keeps it a hold; letting go ends it.
+        finger.slide_to(2.0, 2.0);
+        finger.next_frame();
+        assert!(finger.held());
+        finger.lift();
+        finger.next_frame();
+        assert!(!finger.held());
+    }
+
+    #[test]
     fn a_cleared_finger_is_up_without_a_lift() {
         let mut finger = Finger::default();
         finger.press(1.0, 1.0);
         finger.next_frame();
         finger.slide_to(2.0, 2.0);
-        finger.clear();
+        // The game had it down: it must be told (SysTouch_Clear), or it
+        // counts the next real finger as a second one (a pinch).
+        assert!(finger.clear());
         assert!(finger.is_idle() && !finger.is_down());
         assert_eq!(finger.finger(), None);
         assert_eq!(finger.next_frame(), None);
+        // Only queued, never down: nothing to tell.
+        finger.press(1.0, 1.0);
+        assert!(!finger.clear());
+        assert!(!Finger::default().clear());
     }
 
     #[test]
@@ -4559,14 +5845,150 @@ mod tests {
     }
 
     #[test]
-    fn focus_wraps_and_skips_disabled_buttons() {
+    fn a_column_wraps_up_and_down_and_skips_disabled_buttons() {
+        let menu = title_menu(4);
+        let rects: Vec<_> = (0..4).map(|i| menu.button_rect(i)).collect();
         let enabled = [true, false, true, true];
-        assert_eq!(next_enabled(&enabled, 0, 1), 2);
-        assert_eq!(next_enabled(&enabled, 3, 1), 0);
-        assert_eq!(next_enabled(&enabled, 0, -1), 3);
-        assert_eq!(next_enabled(&enabled, 2, -1), 0);
+        assert_eq!(step_toward(&rects, &enabled, 0, Role::Down), 2);
+        assert_eq!(step_toward(&rects, &enabled, 3, Role::Down), 0);
+        assert_eq!(step_toward(&rects, &enabled, 0, Role::Up), 3);
+        assert_eq!(step_toward(&rects, &enabled, 2, Role::Up), 0);
+        // Nothing to the side of a column.
+        assert_eq!(step_toward(&rects, &enabled, 2, Role::PrevSection), 2);
+        assert_eq!(step_toward(&rects, &enabled, 2, Role::NextSection), 2);
         // Nothing enabled: stay put.
-        assert_eq!(next_enabled(&[false, false], 1, 1), 1);
+        assert_eq!(step_toward(&rects[..2], &[false, false], 1, Role::Down), 1);
+    }
+
+    #[test]
+    fn left_and_right_go_by_where_the_buttons_are_and_never_wrap() {
+        // The user's rule (2026-09-28): in a Yes/No dialog left is always
+        // the left button (No) and right the right one (Yes); left on No
+        // and right on Yes do nothing, and up/down nothing at all. The
+        // game lists a dialog's buttons right to left (a 2026-09-28 log:
+        // Yes at x 255 first, No at x 80).
+        let rects = [(255.0, 200.0, 157.0, 64.0), (80.0, 200.0, 157.0, 64.0)];
+        let on = [true, true];
+        assert_eq!(step_toward(&rects, &on, 0, Role::PrevSection), 1);
+        assert_eq!(step_toward(&rects, &on, 1, Role::PrevSection), 1);
+        assert_eq!(step_toward(&rects, &on, 1, Role::NextSection), 0);
+        assert_eq!(step_toward(&rects, &on, 0, Role::NextSection), 0);
+        for role in [Role::Up, Role::Down] {
+            assert_eq!(step_toward(&rects, &on, 0, role), 0);
+            assert_eq!(step_toward(&rects, &on, 1, role), 1);
+        }
+        // A row of three stops at both ends.
+        let row = location_menu(None).rects;
+        let on = [true; 3];
+        assert_eq!(step_toward(&row, &on, 0, Role::NextSection), 1);
+        assert_eq!(step_toward(&row, &on, 2, Role::NextSection), 2);
+        assert_eq!(step_toward(&row, &on, 0, Role::PrevSection), 0);
+    }
+
+    // The shop's password keyboard: getkeybord's table (`keyrect`,
+    // 0x6ea48), song-summoner-re.md, The shop's password keyboard.
+    fn key_at(key: u8) -> usize {
+        KEYBOARD_KEYS.iter().position(|k| k.4 == key).unwrap()
+    }
+
+    #[test]
+    fn the_keyboard_is_the_games_key_table() {
+        assert_eq!(KEYBOARD_KEYS.len(), 39);
+        assert_eq!(KEYBOARD_KEYS[0], (9.0, 164.0, 39.0, 32.0, b'1'));
+        assert_eq!(KEYBOARD_KEYS[key_at(b'P')], (432.0, 204.0, 39.0, 32.0, b'P'));
+        assert_eq!(KEYBOARD_KEYS[key_at(KEY_BACKSPACE)], (432.0, 244.0, 39.0, 32.0, b'b'));
+        assert_eq!(KEYBOARD_KEYS[key_at(KEY_QUIT)], (9.0, 285.0, 51.0, 30.0, b'r'));
+        assert_eq!(KEYBOARD_KEYS[key_at(KEY_ENTER)], (419.0, 285.0, 51.0, 30.0, b'e'));
+        // Every key's middle is inside its own hit test and no other.
+        for (i, &(x, y, w, h, _)) in KEYBOARD_KEYS.iter().enumerate() {
+            let (cx, cy) = rect_center((x, y, w, h));
+            let hits: Vec<usize> = KEYBOARD_KEYS
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| cx >= k.0 && cx < k.0 + k.2 && cy >= k.1 && cy < k.1 + k.3)
+                .map(|(j, _)| j)
+                .collect();
+            assert_eq!(hits, vec![i]);
+        }
+    }
+
+    #[test]
+    fn the_d_pad_moves_over_the_keys() {
+        let one = key_at(b'1');
+        assert_eq!(keyboard_command(one, 0, Role::NextSection), (key_at(b'2'), None));
+        assert_eq!(keyboard_command(one, 0, Role::Down), (key_at(b'Q'), None));
+        // The rows stop at their ends; up and down wrap round.
+        assert_eq!(keyboard_command(key_at(b'0'), 0, Role::NextSection), (key_at(b'0'), None));
+        assert_eq!(keyboard_command(one, 0, Role::PrevSection), (one, None));
+        assert_eq!(keyboard_command(one, 0, Role::Up), (key_at(KEY_QUIT), None));
+        // The bottom row is set in: Enter is under Backspace.
+        assert_eq!(keyboard_command(key_at(KEY_BACKSPACE), 0, Role::Down), (key_at(KEY_ENTER), None));
+    }
+
+    #[test]
+    fn a_real_keyboard_types_on_the_password_keyboard() {
+        // SDL scancode names, as window.rs sends them.
+        assert_eq!(typed_key("Q"), Some(b'Q'));
+        assert_eq!(typed_key("7"), Some(b'7'));
+        assert_eq!(typed_key("Keypad 7"), Some(b'7'));
+        // The game has no I or O: its keys there are 1 and 0.
+        assert_eq!(typed_key("I"), Some(b'1'));
+        assert_eq!(typed_key("O"), Some(b'0'));
+        assert_eq!(typed_key("Backspace"), Some(KEY_BACKSPACE));
+        assert_eq!(typed_key("Return"), Some(KEY_ENTER));
+        assert_eq!(typed_key("Keypad Enter"), Some(KEY_ENTER));
+        // Everything else keeps its mapping (arrows move, Escape backs
+        // out).
+        for key in ["Up", "Escape", "Space", "F2", "Left Shift", "-"] {
+            assert_eq!(typed_key(key), None, "{key}");
+        }
+        // Every key it types is on the game's keyboard.
+        for c in ('A'..='Z').chain('0'..='9') {
+            let key = typed_key(&c.to_string()).unwrap();
+            assert!(key_index(key).is_some(), "{c}");
+        }
+    }
+
+    #[test]
+    fn confirm_types_the_key_and_back_deletes() {
+        let q = key_at(b'Q');
+        assert_eq!(keyboard_command(q, 0, Role::Confirm), (q, Some((28.5, 220.0))));
+        // Back is Backspace while there's something typed...
+        let (x, y, w, h, _) = KEYBOARD_KEYS[key_at(KEY_BACKSPACE)];
+        let backspace = rect_center((x, y, w, h));
+        assert_eq!(keyboard_command(q, 3, Role::Back), (q, Some(backspace)));
+        // ...and with nothing typed, the key that asks to leave.
+        let (x, y, w, h, _) = KEYBOARD_KEYS[key_at(KEY_QUIT)];
+        assert_eq!(keyboard_command(q, 0, Role::Back), (q, Some(rect_center((x, y, w, h)))));
+    }
+
+    #[test]
+    fn the_password_button_taps_the_shopkeeper() {
+        // ShopFlow_MenuSelect opens the password entry on a still
+        // finger-up at x 40-192, y 108 or more, off the menu's buttons
+        // (a column at x 320, 196 wide).
+        let (x, y) = SHOP_PASSWORD_TAP;
+        assert!((40.0..=192.0).contains(&x) && (108.0..320.0).contains(&y));
+        assert!(x < 320.0 - 98.0);
+    }
+
+    #[test]
+    fn a_caption_never_takes_the_focus_from_a_menu() {
+        // The world map's "Select a map for battle." (2026-09-28, Odin): a
+        // SysDialog with no buttons opens with a one-button menu under it.
+        // It opened last, took the focus, and confirm tapped the middle of
+        // the screen instead of the button.
+        let caption = Widget::Dialog(Dialog {
+            work: 0x3000,
+            rects: Vec::new(),
+            enabled: Vec::new(),
+            outside_cancels: false,
+        });
+        let menu = Widget::Buttons(title_menu(1));
+        let kept = without_captions(vec![caption.clone(), menu.clone()]);
+        assert_eq!(kept, vec![menu]);
+        // Alone, a message is still what confirm taps through.
+        assert_eq!(without_captions(vec![caption.clone()]), vec![caption]);
     }
 
     #[test]
@@ -4670,8 +6092,9 @@ mod tests {
         let set = yes_no();
         assert_eq!(button_command(&set, 0, Role::NextSection), (1, None));
         assert_eq!(button_command(&set, 1, Role::PrevSection), (0, None));
-        // Up/down move too, for column menus.
-        assert_eq!(button_command(&set, 0, Role::Down), (1, None));
+        // No wrapping, and up/down do nothing in a row.
+        assert_eq!(button_command(&set, 1, Role::NextSection), (1, None));
+        assert_eq!(button_command(&set, 0, Role::Down), (0, None));
     }
 
     #[test]
@@ -4814,9 +6237,11 @@ mod tests {
             select_command(&set, 0, Role::NextSection),
             (1, vec![(240.0, 160.0)])
         );
+        // The row doesn't wrap: left on the first icon does nothing.
+        assert_eq!(select_command(&set, 0, Role::PrevSection), (0, vec![]));
         assert_eq!(
-            select_command(&set, 0, Role::PrevSection),
-            (2, vec![(320.0, 160.0)])
+            select_command(&set, 2, Role::PrevSection),
+            (1, vec![(240.0, 160.0)])
         );
     }
 
@@ -5216,12 +6641,12 @@ mod tests {
     fn help_scrolls_a_row_into_view_with_a_short_drag() {
         let h = help();
         assert_eq!(h.scroll_toward(2), None);
-        // Row 4 ends at 312: the rows must glide up 56 + 3, a tenth of that
-        // as a finger-up move.
+        // Row 4 ends at 312: the rows must go up 56 + 3. The move counts on
+        // its frame and 90% of it on the next, before a stop: 59 / 1.9.
         let Some(Gesture::Drag { dy, .. }) = h.scroll_toward(4) else {
             panic!()
         };
-        assert!((dy - -5.9).abs() < 1e-4, "{dy}");
+        assert!((dy - -59.0 / 1.9).abs() < 1e-3, "{dy}");
         // And down for a row above the list.
         let mut scrolled = help();
         scrolled.rows[0].1 = -24.0;
@@ -5260,11 +6685,43 @@ mod tests {
         assert_eq!(help_command(&h, 0, Role::PrevTab), tap(24.0, 160.0));
         assert_eq!(help_command(&h, 0, Role::NextTab), (0, Some(None)));
         assert_eq!(help_command(&h, 0, Role::Back), tap(440.0, 36.0));
-        // Down: finger up 13.6, which glides the text on 136.
+        // Down: half the view, 136, as a move of 136 / 1.9 and a stop.
         let Some(Some(Gesture::Drag { dy, .. })) = help_command(&h, 0, Role::Down).1 else {
             panic!()
         };
-        assert!((dy - -13.6).abs() < 1e-4, "{dy}");
+        assert!((dy - -136.0 / 1.9).abs() < 1e-3, "{dy}");
+    }
+
+    #[test]
+    fn a_help_scroll_is_stopped_by_a_sideways_touch() {
+        // Help glides a move on, 10% less a frame, until a finger goes
+        // down. So a scroll drag is followed by a touch where it ended that
+        // slides 1 point sideways: its finger-down stops the glide, and a
+        // finger-up after a move opens nothing (nor swipes, under 24).
+        let drag = Gesture::Drag {
+            x: 240.0,
+            y: 144.0,
+            dy: -31.0,
+        };
+        assert_eq!(
+            help_stop(drag),
+            Some(Gesture::Slide {
+                x: 240.0,
+                y: 113.0,
+                to_x: 241.0
+            })
+        );
+        assert_eq!(help_stop(Gesture::Tap(1.0, 1.0)), None);
+    }
+
+    #[test]
+    fn a_lists_back_can_be_the_screens_back_icon() {
+        // The shop's lists (the older SysMenu_Check) don't cancel on a tap
+        // off the rows; its back icon does.
+        let mut list = items(0.0);
+        assert_eq!(list_command(&list, 0, Role::Back), (0, Some(Some(OUTSIDE))));
+        list.back = (456.0, 296.0);
+        assert_eq!(list_command(&list, 0, Role::Back), (0, Some(Some((456.0, 296.0)))));
     }
 
     #[test]
@@ -5319,21 +6776,103 @@ mod tests {
 
     // SysMenu lists, from SysMenu_Check2 and menumain. Eight items, four
     // shown, rows 40 high.
+    // The Results screen's pearl split (ResultFlow_DivideSelect).
+
     #[test]
-    fn a_list_outline_stays_inside_the_panel() {
-        // Battle's item window (seen 2026-09-28): the menu is at x 120,
-        // 240 wide, but its rows start at 130 and are as wide as the menu,
-        // so they overhang the panel on the right. The outline stops short
-        // of the panel's edge, and short of the next row (the marker is
-        // drawn a few points outside it).
+    fn result_troopers_are_the_slots_along_the_bottom() {
+        // A finger-up at y 228-300, x 156 + 64i to 204 + 64i, is slot i;
+        // slots below the trooper count are troopers, slot 4 is EXIT.
+        let set = result_divide_set(3, 1);
+        assert_eq!(
+            set.rects,
+            vec![
+                (156.0, 228.0, 48.0, 72.0),
+                (220.0, 228.0, 48.0, 72.0),
+                (284.0, 228.0, 48.0, 72.0),
+            ]
+        );
+        assert!(set.two_tap);
+        assert_eq!(set.selected, Some(1));
+        // Back taps EXIT, which leaves on one tap.
+        assert_eq!(set.back, Some(RESULT_EXIT));
+        let (x, y) = RESULT_EXIT;
+        assert!((412.0..=460.0).contains(&x) && (228.0..=300.0).contains(&y));
+        // Never more than four troopers; a bad selection is none.
+        assert_eq!(result_divide_set(9, -1).rects.len(), 4);
+        assert_eq!(result_divide_set(9, -1).selected, None);
+    }
+
+    #[test]
+    fn result_troopers_select_then_rank_up() {
+        // A tap on another trooper selects it (its status shows); a tap on
+        // the selected one asks to rank it up.
+        let set = result_divide_set(3, 0);
+        assert_eq!(select_command(&set, 0, Role::NextSection), (1, vec![(244.0, 264.0)]));
+        assert_eq!(select_command(&set, 0, Role::Confirm), (0, vec![(180.0, 264.0)]));
+        assert_eq!(select_command(&set, 0, Role::Back), (0, vec![RESULT_EXIT]));
+        // The last trooper is the end: EXIT isn't in the row, so moving
+        // never leaves the screen, and the row doesn't wrap.
+        let set = result_divide_set(3, 2);
+        assert_eq!(select_command(&set, 2, Role::NextSection), (2, vec![]));
+    }
+
+    #[test]
+    fn a_list_highlight_goes_where_the_games_would() {
+        // SysMenu_Disp_Cursor puts the highlight sprite (+0xd28) at the
+        // menu's x (+0xd08) and one point above the row, at its own size.
+        // Battle's item window: menu at x 120, rows from x 130.
         let row = (130.0, 88.0, 240.0, 40.0);
-        assert_eq!(list_outline(row, Some((120.0, 240.0))), (130.0, 91.0, 226.0, 34.0));
-        // No box read: just pulled in.
-        let row = (245.0, 90.0, 230.0, 40.0);
-        assert_eq!(list_outline(row, None), (245.0, 93.0, 226.0, 34.0));
-        // A box that doesn't overlap the row (a misread) is ignored.
+        let highlight = ListHighlight {
+            size: Some((240.0, 42.0)),
+            centred: false,
+            shown: false,
+        };
+        assert_eq!(list_highlight(row, Some(120.0), &highlight), (120.0, 87.0, 240.0, 42.0));
+        // A sprite placed by its centre.
+        let centred = ListHighlight {
+            centred: true,
+            ..highlight
+        };
+        assert_eq!(list_highlight(row, Some(120.0), &centred), (0.0, 66.0, 240.0, 42.0));
+        // No size read (never shown yet): the row's; no menu x: the row's.
+        let no_size = ListHighlight {
+            size: None,
+            ..highlight
+        };
+        assert_eq!(list_highlight(row, None, &no_size), (130.0, 87.0, 240.0, 40.0));
+    }
+
+    #[test]
+    fn the_copy_hides_while_the_games_highlight_shows() {
+        // A finger on a row (a touch, or the controller's own tap) shows the
+        // game's highlight; drawing the copy too would double it.
         let row = (130.0, 88.0, 240.0, 40.0);
-        assert_eq!(list_outline(row, Some((500.0, 10.0))), (130.0, 91.0, 236.0, 34.0));
+        let shown = ListHighlight {
+            size: Some((240.0, 42.0)),
+            centred: false,
+            shown: true,
+        };
+        assert_eq!(list_marker(row, Some(120.0), &shown), None);
+        let hidden = ListHighlight {
+            shown: false,
+            ..shown
+        };
+        assert_eq!(
+            list_marker(row, Some(120.0), &hidden),
+            Some(((120.0, 87.0, 240.0, 42.0), FocusShape::Highlight))
+        );
+    }
+
+    #[test]
+    fn a_list_that_wont_scroll_keeps_the_focus_on_screen() {
+        // The shop's list didn't move for a drag (seen 2026-09-28): the
+        // focus goes to the nearest row shown rather than waiting forever.
+        assert_eq!(items(0.0).clamp_to_shown(6), 3);
+        assert_eq!(items(0.0).clamp_to_shown(2), 2);
+        assert_eq!(items(3.0).clamp_to_shown(0), 3);
+        assert_eq!(items(3.0).clamp_to_shown(7), 6);
+        // Past the end (8 rows, 4 shown from 6): only rows 6 and 7 exist.
+        assert_eq!(items(6.0).clamp_to_shown(0), 6);
     }
 
     fn items(first: f32) -> ListMenu {
@@ -5348,7 +6887,13 @@ mod tests {
             shown: 4,
             settled: true,
             cursor: 0,
-            span: None,
+            menu_x: None,
+            highlight: ListHighlight {
+                size: None,
+                centred: false,
+                shown: false,
+            },
+            back: OUTSIDE,
         }
     }
 
@@ -5411,17 +6956,308 @@ mod tests {
         assert_eq!(moving.scroll_toward(6), None);
     }
 
-    #[test]
-    fn a_drag_step_scrolls_about_one_row() {
-        // menumain: speed (drag / 24) slowed 10% a frame, snapped to a
-        // whole row once below 0.08.
-        let mut speed = LIST_DRAG / 24.0;
-        let mut position = 0.0;
-        while speed >= 0.08 {
-            position += speed;
-            speed *= 0.9;
+    // The shop's quantity dial: tens at (306, 40), ones at (375, 40), each
+    // 80x170 (ShopFlow_BuyMenu), and its Forget it / Confirm dialog.
+    fn dial(tens: i32, ones: i32) -> Dial {
+        let drum = |x: f32, digit: i32| DialDrum {
+            work: 0x5000 + x as u32,
+            rect: (x, 40.0, 80.0, 170.0),
+            digit,
+            settled: true,
+            band: None,
+        };
+        Dial {
+            drums: vec![drum(306.0, tens), drum(375.0, ones)],
         }
-        assert_eq!((position as f32).round(), 1.0);
+    }
+
+    fn quantity_dialog() -> Dialog {
+        Dialog {
+            work: 0x6000,
+            rects: vec![(256.0, 285.0, 104.0, 44.0), (370.0, 285.0, 104.0, 44.0)],
+            enabled: vec![true, true],
+            outside_cancels: false,
+        }
+    }
+
+    #[test]
+    fn dial_commands_pick_a_drum_and_turn_it() {
+        let mut target = vec![0, 0];
+        // Down brings in the digit below the middle band, one more.
+        assert_eq!(dial_command(1, &mut target, Role::Down), (1, None));
+        assert_eq!(target, [0, 1]);
+        assert_eq!(dial_command(1, &mut target, Role::PrevSection), (0, None));
+        assert_eq!(dial_command(0, &mut target, Role::PrevSection), (0, None));
+        // Up brings in the digit above: from 0 that's 9, as the drum shows.
+        dial_command(0, &mut target, Role::Up);
+        assert_eq!(target, [9, 1]);
+        assert_eq!(dial_command(0, &mut target, Role::NextSection), (1, None));
+        assert_eq!(dial_command(1, &mut target, Role::NextSection), (1, None));
+        assert_eq!(
+            dial_command(1, &mut target, Role::Confirm),
+            (1, Some(DialPress::Confirm))
+        );
+        assert_eq!(
+            dial_command(1, &mut target, Role::Back),
+            (1, Some(DialPress::Forget))
+        );
+    }
+
+    #[test]
+    fn the_dial_is_flicked_a_digit_at_a_time_the_short_way() {
+        // Ones 3 -> 4: a finger going up on the ones drum.
+        match dial_step(&dial(0, 3), &[0, 4]) {
+            Some(Gesture::Drag { x, y, dy }) => {
+                assert_eq!((x, y), (415.0, 125.0));
+                assert_eq!(dy, -DIAL_DRAG);
+            }
+            other => panic!("{other:?}"),
+        }
+        // 0 -> 9 is one step back, not nine on.
+        match dial_step(&dial(0, 0), &[0, 9]) {
+            Some(Gesture::Drag { dy, .. }) => assert_eq!(dy, DIAL_DRAG),
+            other => panic!("{other:?}"),
+        }
+        // The tens first.
+        match dial_step(&dial(0, 0), &[1, 1]) {
+            Some(Gesture::Drag { x, .. }) => assert_eq!(x, 346.0),
+            other => panic!("{other:?}"),
+        }
+        // There, or still turning: nothing.
+        assert_eq!(dial_step(&dial(1, 2), &[1, 2]), None);
+        let mut turning = dial(0, 0);
+        turning.drums[1].settled = false;
+        assert_eq!(dial_step(&turning, &[0, 5]), None);
+    }
+
+    #[test]
+    fn dial_confirm_and_back_press_the_dialogs_buttons() {
+        let dialog = quantity_dialog();
+        assert_eq!(dial_press_point(&dialog, DialPress::Confirm), Some((422.0, 307.0)));
+        assert_eq!(dial_press_point(&dialog, DialPress::Forget), Some((308.0, 307.0)));
+        // The outline is the picked drum's middle band.
+        assert_eq!(dial(0, 0).band(1), (375.0, 107.0, 80.0, 36.0));
+    }
+
+    #[test]
+    fn the_play_look_leans_on_the_games_own_highlights() {
+        let marker = Some(((10.0, 20.0, 30.0, 40.0), FocusShape::Brackets));
+        // Debug: the outline as made, whatever the screen asked.
+        assert_eq!(play_look(marker, Clean::Hide, true), marker);
+        assert_eq!(play_look(marker, Clean::Highlight, true), marker);
+        // Play: hidden, or a copy of the game's highlight on the same rect.
+        assert_eq!(play_look(marker, Clean::Hide, false), None);
+        assert_eq!(
+            play_look(marker, Clean::Highlight, false),
+            Some(((10.0, 20.0, 30.0, 40.0), FocusShape::Highlight))
+        );
+        assert_eq!(play_look(marker, Clean::Same, false), marker);
+        assert_eq!(play_look(None, Clean::Highlight, false), None);
+        // A dialog's copy sits on its button art, not the outline's space.
+        let art = (258.0, 143.0, 142.0, 44.0);
+        assert_eq!(
+            play_look(marker, Clean::HighlightAt(art), false),
+            Some((art, FocusShape::Highlight))
+        );
+        assert_eq!(play_look(marker, Clean::HighlightAt(art), true), marker);
+        assert_eq!(play_look(None, Clean::HighlightAt(art), false), None);
+    }
+
+    #[test]
+    fn the_diamond_shows_only_where_the_games_cursor_cant() {
+        // A tile the finger can rest on: the game's cursor.
+        assert_eq!(diamond_look(true, false), Clean::Hide);
+        assert_eq!(diamond_look(true, true), Clean::Hide);
+        // Out of reach, but a pan may still bring it in.
+        assert_eq!(diamond_look(false, false), Clean::Hide);
+        // Out of reach for good: touchHLE's diamond is all there is.
+        assert_eq!(diamond_look(false, true), Clean::Same);
+    }
+
+    #[test]
+    fn a_pressed_menus_highlight_stays_hidden_a_moment() {
+        assert!(!just_pressed(None, 100));
+        assert!(just_pressed(Some(100), 100));
+        assert!(just_pressed(Some(100), 100 + PRESS_HIDE_FRAMES - 1));
+        assert!(!just_pressed(Some(100), 100 + PRESS_HIDE_FRAMES));
+    }
+
+    #[test]
+    fn the_button_highlight_covers_the_button_art() {
+        // Soul Master's Place's 208×54 menu buttons (2026-09-28
+        // screenshot: the art is about 5 in from each side, 4 from the
+        // top and 6 from the bottom).
+        let (x, y, w, h) = button_art((216.0, 119.0, 208.0, 54.0));
+        let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+        assert!(close(x, 216.0 + 208.0 * 4.0 / 144.0), "{x}");
+        assert!(close(y, 119.0 + 54.0 * 4.0 / 56.0), "{y}");
+        assert!(close(w, 208.0 * 136.0 / 144.0), "{w}");
+        assert!(close(h, 54.0 * 45.0 / 56.0), "{h}");
+        assert!((5.0..7.0).contains(&(x - 216.0)));
+        assert!((5.0..8.0).contains(&(119.0 + 54.0 - (y + h))));
+    }
+
+    #[test]
+    fn the_dial_highlight_sits_on_the_games_band() {
+        let mut d = dial(0, 0);
+        // No band sprite read: the middle band.
+        assert_eq!(d.highlight(1), d.band(1));
+        // With it: that frame's art.
+        let sprite = (375.0, 97.0, 80.0, 32.0);
+        d.drums[1].band = Some(sprite);
+        assert_eq!(d.highlight(1), button_art(sprite));
+    }
+
+    #[test]
+    fn a_select_then_press_screen_starts_with_its_first_item_selected() {
+        let set = ButtonSet {
+            rects: vec![(98.0, 138.0, 44.0, 44.0), (178.0, 138.0, 44.0, 44.0)],
+            enabled: vec![true, true],
+            back: None,
+            two_tap: true,
+            selected: None,
+        };
+        assert_eq!(preselect_tap(&set, 0, true, false), Some((120.0, 160.0)));
+        // Once only, with the controller in use, and never over a selection.
+        assert_eq!(preselect_tap(&set, 0, true, true), None);
+        assert_eq!(preselect_tap(&set, 0, false, false), None);
+        let selected = ButtonSet {
+            selected: Some(1),
+            ..set.clone()
+        };
+        assert_eq!(preselect_tap(&selected, 1, true, false), None);
+        // Not a disabled item, and not a screen that presses on one tap.
+        let disabled = ButtonSet {
+            enabled: vec![false, true],
+            ..set.clone()
+        };
+        assert_eq!(preselect_tap(&disabled, 0, true, false), None);
+        let one_tap = ButtonSet {
+            two_tap: false,
+            ..set
+        };
+        assert_eq!(preselect_tap(&one_tap, 0, true, false), None);
+    }
+
+    #[test]
+    fn presses_nothing_uses_are_dropped() {
+        let mut age = CommandAge::default();
+        // Two presses sit unused on a screen that ignores them.
+        for _ in 0..STALE_COMMAND_FRAMES {
+            assert!(!age.stale(2, 2));
+        }
+        assert!(age.stale(2, 2));
+        // Presses being used, or none waiting, never age.
+        let mut age = CommandAge::default();
+        for _ in 0..100 {
+            assert!(!age.stale(3, 2));
+            assert!(!age.stale(0, 0));
+        }
+        // Using one starts the wait over.
+        let mut age = CommandAge::default();
+        for _ in 0..STALE_COMMAND_FRAMES {
+            assert!(!age.stale(2, 2));
+        }
+        assert!(!age.stale(2, 1));
+        assert!(!age.stale(1, 1));
+    }
+
+    #[test]
+    fn a_scroll_drag_starts_off_the_rows() {
+        // Left of the rows (x 245 on), level with the first one shown, so
+        // the finger going down doesn't pick a row.
+        match items(2.0).scroll_toward(7) {
+            Some(Gesture::Drag { x, y, .. }) => {
+                assert!(x < 245.0);
+                assert_eq!(y, 110.0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_scroll_drag_is_judged_by_where_the_list_went() {
+        // Wanted later rows (the position going up).
+        assert_eq!(judge_scroll(0.0, 1.0, true), ScrollOutcome::Moved);
+        assert_eq!(judge_scroll(5.0, 6.0, false), ScrollOutcome::Reversed);
+        assert_eq!(judge_scroll(5.0, 4.0, false), ScrollOutcome::Moved);
+        assert_eq!(judge_scroll(6.0, 5.0, true), ScrollOutcome::Reversed);
+        // At the top, a drag the wrong way can't move it at all.
+        assert_eq!(judge_scroll(0.0, 0.0, true), ScrollOutcome::Still);
+    }
+
+    /// One frame of `menumain`'s scroll (0x51224, the cursor at -1): at
+    /// 0.08 rows a frame or more, glide (position += speed, speed x 0.9);
+    /// below it, push toward the nearest row by min(0.005 / distance,
+    /// distance), added to the speed, and stop at a whole row as soon as
+    /// the position crosses one. Checked against the 2026-09-28 log.
+    fn menumain_step(position: f32, speed: f32, last: f32) -> (f32, f32) {
+        let (mut position, mut speed) = (position, speed);
+        if speed.abs() < 0.08 {
+            let frac = position - position.floor();
+            let push = if frac > 0.5 {
+                let d = 1.0 - frac;
+                (0.005 / f64::from(d)).min(f64::from(d)) as f32
+            } else if frac > 0.0 {
+                -(0.005 / f64::from(frac)).min(f64::from(frac)) as f32
+            } else {
+                0.0
+            };
+            speed += push;
+            let new = position + speed;
+            if new.floor() != position.floor() {
+                speed = 0.0;
+                position = (position + 0.5).floor();
+            } else {
+                position = new;
+            }
+        } else {
+            position += speed;
+            // In doubles, as the game does it.
+            speed = (f64::from(speed) * 0.9) as f32;
+        }
+        if position < 0.0 {
+            (position, speed) = (0.0, 0.0);
+        }
+        if position > last {
+            (position, speed) = (last, 0.0);
+        }
+        (position, speed)
+    }
+
+    /// Where a list at `position` stops after a drag of `dy`, and after
+    /// how many frames.
+    fn glide(position: f32, dy: f32) -> (f32, u32) {
+        let (mut position, mut speed) = (position, -dy / 24.0);
+        for frame in 1..200 {
+            (position, speed) = menumain_step(position, speed, 7.0);
+            if speed == 0.0 {
+                return (position, frame);
+            }
+        }
+        panic!("still gliding at {position}");
+    }
+
+    #[test]
+    fn menumain_model_matches_the_log() {
+        // The shop's list, 2026-09-28: from row 3, a drag of 4.8 down
+        // turned back at 1.65 and ended on row 4, 47 frames later.
+        let (mut position, mut speed) = (3.0, -0.2);
+        for _ in 0..13 {
+            (position, speed) = menumain_step(position, speed, 7.0);
+        }
+        assert!((position - 1.6534).abs() < 0.001, "{position}");
+        assert_eq!(glide(3.0, 4.8), (4.0, 47));
+    }
+
+    #[test]
+    fn a_drag_step_scrolls_one_row_either_way() {
+        for start in [1.0, 3.0, 5.0] {
+            let (on, frames) = glide(start, -LIST_DRAG);
+            assert_eq!(on, start + 1.0);
+            assert!(frames <= 12, "{frames}");
+            assert_eq!(glide(start, LIST_DRAG).0, start - 1.0);
+        }
     }
 
     #[test]

@@ -79,6 +79,13 @@ Game controller options:
         Xbox, Circle on PlayStation, A on Switch). The other one goes back.
         The default is south.
 
+    --controller-debug
+        Song Summoner: show the controller's debug overlays. Every focused
+        item gets an outline, battle maps get touchHLE's tile diamond (and,
+        in debug builds, the tile grid). Without it the controller leans on
+        the game's own highlights and draws a copy of the game's highlight
+        only where the game has none.
+
     --x-tilt-range=...
     --y-tilt-range=...
         Set the simulated rotation range of the device axis mapped to the analog
@@ -293,16 +300,18 @@ Other options:
 
     --music-library
         Give the app a music library made from a folder of your own audio
-        files (mp3, m4a, aac, wav, caf). The first time, a folder dialog asks
-        where your music is; the choice is kept in library/source.txt. The
-        folder is re-read in the background at every launch, which is quick
-        because only new or changed files are read again.
-        Desktop only: on Android the music folder is chosen in the app's
-        setup screen instead.
+        files (mp3, m4a, aac, wav, caf). The folders are added in Song
+        Summoner's Setup menu (Music tab) and kept in library/source.txt, one
+        per line; with none yet, the library is empty. The folders are
+        re-read in the background at every launch, which is quick because
+        only new or changed files are read again.
+        Desktop only: on Android the folders are chosen in the same Setup
+        menu, through the system's folder picker.
 
     --choose-music-folder
-        Like --music-library, but asks for the music folder again even if one
-        was chosen before.
+        Like --music-library, but first asks for a folder with a dialog. The
+        folder picked REPLACES all the saved music folders; to add one
+        instead, use the Setup menu's Music tab.
 
     --ignore-gl-errors
         Ignore host OpenGL errors as queried by glGetError function.

@@ -71,6 +71,24 @@ pub(super) struct State {
     counted: bool,
     notifications: bool,
     player: Player,
+    /// Paused by touchHLE itself (Song Summoner's Setup menu), not the app:
+    /// [host_pause] resumes only then.
+    host_paused: bool,
+}
+
+/// Pause the user's music while touchHLE pauses the app (Song Summoner's
+/// Setup menu), and resume it after. Resumes only what it paused, and
+/// sends no notifications: the app never knew it was paused.
+pub fn host_pause(env: &mut Environment, pause: bool) {
+    let music = &mut env.framework_state.media_player.music_player;
+    if pause {
+        if music.player.is_loaded() && !music.player.is_paused() {
+            music.player.pause(&mut env.openal_manager);
+            music.host_paused = true;
+        }
+    } else if std::mem::take(&mut music.host_paused) {
+        music.player.resume(&mut env.openal_manager);
+    }
 }
 
 fn state(env: &mut Environment) -> &mut State {

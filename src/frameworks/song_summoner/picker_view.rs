@@ -18,7 +18,7 @@
 //! artist/album/playlist), a list of 55-point rows with A–Z section headers
 //! and an index strip, and a four-tab bar (Song, Artist, Album, Playlist).
 //!
-//! It also works with a game controller ([handle_pad_button], roles in
+//! It also works with a game controller ([handle_role], roles in
 //! [super::pad]): the D-pad moves a focus (the touched-row glow) up and
 //! down or by A–Z section, the shoulder buttons switch tabs, and the
 //! confirm/back buttons pick or open a row and go ‹ Back or Cancel. The
@@ -44,7 +44,7 @@ use crate::media::artwork::{self, Bitmap};
 use crate::media::index::{self, Library};
 use crate::media::library;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, SEL};
-use crate::window::{DeviceOrientation, PadButton};
+use crate::window::DeviceOrientation;
 use crate::Environment;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -405,8 +405,8 @@ pub(super) struct Picker {
     row_cache: Vec<((u64, usize, bool), Rc<Bitmap>)>,
     /// Keyed by title, ‹ Back label and back button icon.
     nav_bar: Option<(NavBarKey, Rc<Bitmap>)>,
-    /// Keyed by tab and shoulder button icons.
-    tab_bar: Option<((usize, Option<Family>), Rc<Bitmap>)>,
+    /// Keyed by tab and the previous/next tab buttons' icons.
+    tab_bar: Option<((usize, Option<(Family, (Glyph, Glyph))>), Rc<Bitmap>)>,
     index_strip: Option<(Option<char>, Rc<Bitmap>)>,
 }
 
@@ -637,6 +637,14 @@ pub(super) fn tab_of(env: &mut Environment, controller: id) -> usize {
 /// The game hides the picker while its confirmation panel is up, and shows
 /// the same one again after "No", so the scroll position is kept. Only a
 /// half-finished touch or fling is dropped.
+/// The Setup menu is opening and takes every release until it closes:
+/// stop repeating a held direction now, or it would scroll on and on.
+pub(super) fn release_held(env: &mut Environment) {
+    for picker in env.framework_state.song_summoner.pickers.values_mut() {
+        picker.held = None;
+    }
+}
+
 pub(super) fn set_hidden(env: &mut Environment, controller: id, hidden: bool) {
     let Some(picker) = env
         .framework_state
@@ -750,6 +758,7 @@ fn tick(env: &mut Environment, controller: id) -> bool {
         }
     }
 
+    let (repeat_delay, repeat_interval) = super::setup::repeat_timing(env);
     let Some(picker) = env.framework_state.song_summoner.pickers.get_mut(&controller) else {
         return false;
     };
@@ -763,7 +772,11 @@ fn tick(env: &mut Environment, controller: id) -> bool {
         moving |= picker.list_mut().step(dt);
     }
     if let Some(held) = &mut picker.held {
-        let due = pad::repeats_due(held.since.elapsed().as_secs_f32());
+        let due = pad::repeats_due_at(
+            held.since.elapsed().as_secs_f32(),
+            repeat_delay,
+            repeat_interval,
+        );
         // At most a few per frame, in case a frame came very late.
         let extra = due.saturating_sub(held.fired).min(4);
         held.fired = due;
@@ -1131,13 +1144,14 @@ fn pad_action(list: &mut ListView, role: Role, waking: bool) -> Action {
     Action::None
 }
 
-/// A controller button went down or up. Returns false if there's no picker
-/// on screen to take it.
-pub(super) fn handle_pad_button(
+/// A controller button or key went down or up, already mapped to its
+/// command. `family` is the pad's make, for its icons (`None` for a key).
+/// Returns false if there's no picker on screen to take it.
+pub(super) fn handle_role(
     env: &mut Environment,
-    button: PadButton,
+    role: Role,
     pressed: bool,
-    controller_type: u32,
+    family: Option<Family>,
 ) -> bool {
     // While the picker is hidden, the game's own confirmation panel is up,
     // and that's the game's to handle.
@@ -1153,11 +1167,9 @@ pub(super) fn handle_pad_button(
     };
     // Buttons the picker has no use for still don't reach the game.
     // The triggers only zoom battle's map.
-    let Some(role) = pad::role(button, env.options.confirm_button)
-        .filter(|role| !matches!(role, Role::ZoomOut | Role::ZoomIn))
-    else {
+    if matches!(role, Role::ZoomOut | Role::ZoomIn) {
         return true;
-    };
+    }
     let picker = env
         .framework_state
         .song_summoner
@@ -1174,7 +1186,9 @@ pub(super) fn handle_pad_button(
     if picker.transition.is_some() || picker.touch.is_some() || library::is_scanning() {
         return true;
     }
-    picker.family = Family::from_sdl_type(controller_type);
+    if let Some(family) = family {
+        picker.family = family;
+    }
     let waking = !picker.pad_mode;
     picker.pad_mode = true;
     let action = match role {
@@ -1600,7 +1614,12 @@ fn snapshot_list(env: &mut Environment, controller: id) -> Option<Bitmap> {
 fn render(env: &mut Environment, controller: id) -> Option<Bitmap> {
     resolve_fighters(env, controller);
     let ctx = ctx(env);
-    let back_glyph = pad::back_glyph(env.options.confirm_button);
+    // The player's own buttons for back and the tabs.
+    let back_glyph = pad::glyph_of(super::setup::button_for(env, Role::Back));
+    let tab_glyphs = (
+        pad::glyph_of(super::setup::button_for(env, Role::PrevTab)),
+        pad::glyph_of(super::setup::button_for(env, Role::NextTab)),
+    );
     let state = &mut env.framework_state.song_summoner;
     let picker = state.pickers.get_mut(&controller)?;
     let fighters = &state.fighters;
@@ -1649,14 +1668,14 @@ fn render(env: &mut Environment, controller: id) -> Option<Bitmap> {
     };
     canvas.blit(&nav_bar, 0, 0, 1.0);
 
-    let tab_key = (picker.tab, family);
+    let tab_key = (picker.tab, family.map(|f| (f, tab_glyphs)));
     let tab_bar = match &picker.tab_bar {
         Some((key, bitmap)) if *key == tab_key => bitmap.clone(),
         _ => {
             let bumpers = family.map(|f| {
                 (
-                    state.glyphs.get(f, Glyph::BumperLeft, PROMPT_GLYPH_SIZE),
-                    state.glyphs.get(f, Glyph::BumperRight, PROMPT_GLYPH_SIZE),
+                    state.glyphs.get(f, tab_glyphs.0, PROMPT_GLYPH_SIZE),
+                    state.glyphs.get(f, tab_glyphs.1, PROMPT_GLYPH_SIZE),
                 )
             });
             let bumpers = bumpers.as_ref().map(|(l, r)| (&**l, &**r));

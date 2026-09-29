@@ -1,17 +1,17 @@
 # Run me: building Song Summoner Revival
 
 Commands for building Windows and Android, in release and debug. Everything
-here is PowerShell. Run each command on its own, from the folder named in
-its section.
+here is PowerShell, and **every command runs from the repo root**, as written.
+Run each one on its own.
 
 | Build | Command | Output |
 |---|---|---|
 | Windows release | `cargo dist-windows` | `dist\windows\` |
 | Windows debug | `cargo debug-windows` | `debug\windows\` |
-| Android Song Summoner release | `.\gradlew.bat :app:assembleSongsummonerRelease` | `dist\song-summoner-<version>.apk` |
-| Android Song Summoner debug | `.\gradlew.bat :app:assembleSongsummonerDebug` | `debug\song-summoner-<version>.apk` |
-| Android touchHLE release | `.\gradlew.bat :app:assembleTouchhleRelease` | `dist\touchhle-<version>.apk` |
-| Android touchHLE debug | `.\gradlew.bat :app:assembleTouchhleDebug` | `debug\touchhle-<version>.apk` |
+| Android Song Summoner release | `.\android\gradlew.bat -p android :app:assembleSongsummonerRelease` | `dist\song-summoner-<version>.apk` |
+| Android Song Summoner debug | `.\android\gradlew.bat -p android :app:assembleSongsummonerDebug` | `debug\song-summoner-<version>.apk` |
+| Android touchHLE release | `.\android\gradlew.bat -p android :app:assembleTouchhleRelease` | `dist\touchhle-<version>.apk` |
+| Android touchHLE debug | `.\android\gradlew.bat -p android :app:assembleTouchhleDebug` | `debug\touchhle-<version>.apk` |
 
 `<version>` is `[workspace.package] version` in the root `Cargo.toml`
 (currently `0.2.3`).
@@ -29,7 +29,7 @@ Full details are in [dev-docs/building.md](dev-docs/building.md).
 - For Android, also install Android Studio (SDK + NDK). The NDK version is
   pinned in `android\app\build.gradle.kts`.
 
-Fetch the submodules (from the repo root):
+Fetch the submodules:
 
 ```bash
 git submodule update --init
@@ -56,7 +56,7 @@ sdk.dir=C\:\\Users\\<you>\\AppData\\Local\\Android\\Sdk
 
 ---
 
-## 2. Windows (run from the repo root)
+## 2. Windows
 
 The helper in `xtask/` runs `cargo build`, then puts `touchHLE.exe` together
 with `touchHLE_dylibs\`, `touchHLE_fonts\`, `res\` and
@@ -78,9 +78,10 @@ cargo debug-windows
 
 ---
 
-## 3. Android (run from `android\`)
+## 3. Android
 
-Gradle builds the Rust side itself with `cargo ndk`, so there's no separate
+Gradle is pointed at `android\` with `-p`; without it, it looks for a build
+in the root and fails. Gradle builds the Rust side itself with `cargo ndk`, so there's no separate
 cargo step. Only `arm64-v8a` is built. The Rust core is built in release mode
 even for debug APKs, because a debug build of the emulator is too slow.
 
@@ -89,20 +90,23 @@ After every assemble, the APK is copied out of the build tree: release to
 
 ### Song Summoner flavor (`com.sqefam.songsummoner`)
 
-This is the wrapper that launches the game automatically. On first run it
-asks for storage access and for the IPA, which lives in
-`/sdcard/SongSummoner/`.
+This is the wrapper that launches the game automatically. It asks for no
+storage permission. On first run it asks for the IPA, then a save folder
+(picked with the system's folder picker), then starts the game. The IPA
+and everything touchHLE writes live in the app's own folder,
+`/sdcard/Android/data/com.sqefam.songsummoner/files/`; saves, settings,
+backups and bug reports are also copied to the save folder.
 
 Release:
 
 ```bash
-.\gradlew.bat :app:assembleSongsummonerRelease
+.\android\gradlew.bat -p android :app:assembleSongsummonerRelease
 ```
 
 Debug:
 
 ```bash
-.\gradlew.bat :app:assembleSongsummonerDebug
+.\android\gradlew.bat -p android :app:assembleSongsummonerDebug
 ```
 
 ### touchHLE flavor (`org.touchhle.android`)
@@ -112,16 +116,16 @@ This is the plain emulator with its app picker.
 Release:
 
 ```bash
-.\gradlew.bat :app:assembleTouchhleRelease
+.\android\gradlew.bat -p android :app:assembleTouchhleRelease
 ```
 
 Debug:
 
 ```bash
-.\gradlew.bat :app:assembleTouchhleDebug
+.\android\gradlew.bat -p android :app:assembleTouchhleDebug
 ```
 
-### Install on a device (still from `android\`)
+### Install on a device
 
 Change the version number if `Cargo.toml` has moved on. `-r` keeps the
 existing app data.
@@ -129,13 +133,13 @@ existing app data.
 Release:
 
 ```bash
-adb install -r ..\dist\song-summoner-0.2.3.apk
+adb install -r .\dist\song-summoner-0.2.3.apk
 ```
 
 Debug:
 
 ```bash
-adb install -r ..\debug\song-summoner-0.2.3.apk
+adb install -r .\debug\song-summoner-0.2.3.apk
 ```
 
 For the touchHLE flavor, swap `song-summoner` for `touchhle` in the file
@@ -143,12 +147,12 @@ name.
 
 ---
 
-## 4. Running on Windows (run from the repo root)
+## 4. Running on Windows
 
 touchHLE loads its resources and writes its log, sandbox (saves) and
-music-library files relative to its working folder. These commands stay in
-the repo root but set the working folder to the build output, so the root
-stays clean. They use your own IPA from `apps\`.
+music-library files relative to its working folder. These commands set the
+working folder to the build output, so the root stays clean. They use your
+own IPA from `apps\`.
 
 Debug:
 
@@ -173,7 +177,7 @@ Either one clutters the root with runtime files.
 
 ---
 
-## 5. Tests and lint (run from the repo root)
+## 5. Tests and lint
 
 Run all tests:
 
@@ -234,7 +238,7 @@ cargo clippy -- --deny warnings
 
 ---
 
-## 6. Music library scan checks (run from the repo root)
+## 6. Music library scan checks
 
 Each scan ends with one log line that says how many files were read and
 where the time went:
@@ -261,7 +265,7 @@ Reference numbers (OnePlus 8T, 1388 songs): clean 5.6 s, incremental
 Clean scan: delete the index, launch, and wait until the game is up:
 
 ```bash
-adb shell "rm -f /sdcard/SongSummoner/library/index.tsv"
+adb shell "rm -f /sdcard/Android/data/com.sqefam.songsummoner/files/library/index.tsv"
 ```
 
 ```bash
@@ -315,7 +319,7 @@ log the same way.
 
 ## 7. Device helpers (adb)
 
-These work from any folder. Swap in `org.touchhle.android` and
+Swap in `org.touchhle.android` and
 `/sdcard/touchHLE/` for the touchHLE flavor.
 
 List connected devices:
@@ -324,11 +328,11 @@ List connected devices:
 adb devices
 ```
 
-Push your IPA to the device instead of using the in-app import (run from the
-folder that holds the IPA):
+Push your IPA (from `apps\`) to the device instead of using the in-app
+import:
 
 ```bash
-adb push "Song Summoner The Unsung Heroes Encore.ipa" /sdcard/SongSummoner/
+adb push ".\apps\Song Summoner The Unsung Heroes Encore.ipa" /sdcard/Android/data/com.sqefam.songsummoner/files/
 ```
 
 Launch the app:
@@ -355,33 +359,33 @@ Dump touchHLE's logcat output only:
 adb logcat -d "touchHLE:V" "*:S"
 ```
 
-touchHLE also writes a log file next to its user data. Pull it into the
-current folder:
+touchHLE also writes a log file next to its user data. Pull it into
+`debug\` (gitignored):
 
 ```bash
-adb pull /sdcard/SongSummoner/touchHLE_log.txt
+adb pull /sdcard/Android/data/com.sqefam.songsummoner/files/touchHLE_log.txt .\debug\touchHLE_log_android.txt
 ```
 
 Check which music folder the library is read from (a SAF tree URI):
 
 ```bash
-adb shell cat /sdcard/SongSummoner/library/source.txt
+adb shell cat /sdcard/Android/data/com.sqefam.songsummoner/files/library/source.txt
 ```
 
 List the library index and the cover-art cache:
 
 ```bash
-adb shell "ls -l /sdcard/SongSummoner/library /sdcard/SongSummoner/library/art | head -20"
+adb shell "ls -l /sdcard/Android/data/com.sqefam.songsummoner/files/library /sdcard/Android/data/com.sqefam.songsummoner/files/library/art | head -20"
 ```
 
 Delete the IPA from the device, e.g. to test the first-run import again:
 
 ```bash
-adb shell "rm '/sdcard/SongSummoner/Song Summoner The Unsung Heroes Encore.ipa'"
+adb shell "rm '/sdcard/Android/data/com.sqefam.songsummoner/files/Song Summoner The Unsung Heroes Encore.ipa'"
 ```
 
-Uninstall the app. This removes the app but not `/sdcard/SongSummoner/`, so
-saves and the IPA stay:
+Uninstall the app. This deletes the app's own folder, IPA included; only
+the copy in the save folder you picked stays:
 
 ```bash
 adb uninstall com.sqefam.songsummoner
@@ -394,15 +398,15 @@ adb uninstall com.sqefam.songsummoner
 - **Gradle download fails with a PKIX / certificate error:** add this line
   to `%USERPROFILE%\.gradle\gradle.properties` (not to the repo):
   `systemProp.javax.net.ssl.trustStoreType=Windows-ROOT`
-- **Android build fails in the Rust step:** build the library on its own
-  (from the repo root) to see the real error:
+- **Android build fails in the Rust step:** build the library on its own to
+  see the real error:
 
 ```bash
 cargo ndk -t arm64-v8a build --release
 ```
 
-- **Clean Android rebuild** (from `android\`):
+- **Clean Android rebuild:**
 
 ```bash
-.\gradlew.bat clean
+.\android\gradlew.bat -p android clean
 ```

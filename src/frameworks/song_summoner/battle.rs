@@ -256,6 +256,10 @@ pub const PAN_MAX: (f32, f32) = (200.0, 100.0);
 pub const PREV_UNIT_ARROW: Point = (78.0, 296.0);
 pub const NEXT_UNIT_ARROW: Point = (401.0, 288.0);
 
+// Unit select's bounds as first verified in play; the code now goes
+// through `holdable_in` and `UNIT_SELECT_HOLD`, and the tests pin the two
+// to each other.
+#[cfg(test)]
 pub fn tappable((x, y): Point) -> bool {
     let (ax, ay, aw, ah) = TAP_AREA;
     (ax..=ax + aw).contains(&x) && (ay..=ay + ah).contains(&y)
@@ -279,6 +283,7 @@ pub const SELECT_HOLD_FRAMES: u32 = 10;
 /// unit under it the current one (`Update_StatusPanelList`), so its release
 /// opens the command ring (or another team's status) rather than only
 /// selecting it, as a tap on an unselected unit does.
+#[cfg(test)]
 pub fn holdable(centre: Point) -> bool {
     // 8 points inside the rect's bottom, as verified in play.
     tappable(centre) && centre.1 + HOLD_OFFSET <= UNIT_SELECT_AREA.3 - 8.0
@@ -316,6 +321,15 @@ pub type Rect = (f32, f32, f32, f32);
 /// overload, 0x3b88) take them anywhere.
 pub const UNIT_SELECT_AREA: Rect = (0.0, 0.0, 480.0, 256.0);
 pub const WHOLE_SCREEN: Rect = (0.0, 0.0, SCREEN.0, SCREEN.1);
+/// Unit select's area for [holdable_in]: [UNIT_SELECT_AREA] less 4 points
+/// at the bottom, so the finger stays at or above y 248, as verified in
+/// play (the same tiles as `holdable`).
+pub const UNIT_SELECT_HOLD: Rect = (
+    UNIT_SELECT_AREA.0,
+    UNIT_SELECT_AREA.1,
+    UNIT_SELECT_AREA.2,
+    UNIT_SELECT_AREA.3 - 4.0,
+);
 
 /// Whether a tile whose centre is at `centre` can be picked with a finger
 /// held [HOLD_OFFSET] below it, when `Tactics_CtrlTest` takes holds in
@@ -383,14 +397,37 @@ fn first_min<T: Copy, K: PartialOrd>(items: impl Iterator<Item = T>, key: impl F
     best.map(|(item, _)| item)
 }
 
+/// Who takes the controller now: [phase_owner], unless a script is running
+/// (`_tactics_script_flag`: `Tactics_Main` runs the script loop instead of
+/// the phase, and a map script can show a message in any phase, like a
+/// buried treasure in unit end) or a message waits for a tap (its "tap to
+/// continue" mark shows). Those take a tap anywhere.
+pub fn owner_now(phase: u32, script_running: bool, message_waiting: bool) -> Owner {
+    if script_running || message_waiting {
+        Owner::TapAnywhere
+    } else {
+        phase_owner(phase)
+    }
+}
+
 /// Where unit select's cursor goes when the phase starts (a new turn,
 /// or back from the ring): the selected unit's tile, else the game's own
 /// cursor, else the middle of the map.
-pub fn unit_select_start(grid: &Grid, selected: Option<Tile>, game_cursor: Tile) -> Tile {
-    selected
-        .filter(|&t| grid.contains(t))
-        .or(Some(game_cursor).filter(|&t| grid.contains(t)))
-        .unwrap_or((grid.w / 2, grid.h / 2))
+///
+/// `turn_start`: unit select comes straight after the turn script (phase
+/// 18), a team's turn starting. The game has put its cursor on that team's
+/// first unit then, while the selected unit is still whichever acted last
+/// (the enemy, after its turn), so the cursor comes first.
+pub fn unit_select_start(
+    grid: &Grid,
+    selected: Option<Tile>,
+    game_cursor: Tile,
+    turn_start: bool,
+) -> Tile {
+    let selected = selected.filter(|&t| grid.contains(t));
+    let cursor = Some(game_cursor).filter(|&t| grid.contains(t));
+    let first = if turn_start { cursor.or(selected) } else { selected.or(cursor) };
+    first.unwrap_or((grid.w / 2, grid.h / 2))
 }
 
 /// Where the held-finger screens' cursor starts: the listed tile nearest
@@ -472,6 +509,13 @@ pub struct FollowView<'a> {
     pub act: bool,
     /// The camera when the last pan started (see [pan_toward]).
     pub last_pan: Option<Point>,
+    /// Where `Tactics_CtrlTest` takes a hold ([holdable_in]): [WHOLE_SCREEN],
+    /// or [UNIT_SELECT_HOLD].
+    pub hold_area: Rect,
+    /// Where the finger may let go harmlessly, and a tap too low to hold
+    /// may go: [HARMLESS_AREA], or in unit select [TAP_AREA] (above the
+    /// status panel, MENU and the arrows).
+    pub harmless_area: Rect,
 }
 
 /// The next thing a held finger following a locked cursor does.
@@ -495,17 +539,16 @@ pub enum FollowAction {
     Stuck,
 }
 
-/// The finger's next move for a cursor locked to `view.accepted`, held
-/// anywhere on screen ([WHOLE_SCREEN]). It only ever lets go on a tile that
-/// acts to act: to reach a tile off screen (or come up) it slides to a
-/// harmless point first.
+/// The finger's next move for a cursor held in `view.hold_area`. It only
+/// ever lets go on a tile that acts (`view.accepted`) to act: to reach a
+/// tile off screen (or come up) it slides to a harmless point first.
 pub fn follow(view: &FollowView) -> FollowAction {
     let camera = view.camera;
     let target = view.cursor.filter(|_| view.want_down);
-    let holdable = |tile: Tile| holdable_in(camera.tile_centre(tile), WHOLE_SCREEN);
+    let holdable = |tile: Tile| holdable_in(camera.tile_centre(tile), view.hold_area);
     let come_up = |finger: Point| {
         if view.accepted.contains(&camera.hold_tile_at(finger)) {
-            harmless_point(camera, view.grid, view.accepted, HARMLESS_AREA)
+            harmless_point(camera, view.grid, view.accepted, view.harmless_area)
                 .map_or(FollowAction::Stuck, FollowAction::LiftAt)
         } else {
             FollowAction::Lift
@@ -535,7 +578,7 @@ pub fn follow(view: &FollowView) -> FollowAction {
                 return FollowAction::Pan(dx, dy);
             }
             let centre = camera.tile_centre(tile);
-            let (ax, ay, aw, ah) = HARMLESS_AREA;
+            let (ax, ay, aw, ah) = view.harmless_area;
             let tappable = (ax..=ax + aw).contains(&centre.0) && (ay..=ay + ah).contains(&centre.1);
             if view.act && tappable {
                 FollowAction::Tap(centre)
@@ -1102,6 +1145,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_script_or_a_waiting_message_takes_a_tap_in_any_phase() {
+        // Seen 2026-09-28: a map script's "You found a buried treasure
+        // chest!" in unit end (28), which otherwise drops presses.
+        // Tactics_Main runs the script loop instead of the phase while
+        // _tactics_script_flag is set.
+        assert_eq!(owner_now(28, true, false), Owner::TapAnywhere);
+        assert_eq!(owner_now(23, false, true), Owner::TapAnywhere);
+        assert_eq!(owner_now(19, true, false), Owner::TapAnywhere);
+        // Otherwise the phase's own owner.
+        assert_eq!(owner_now(28, false, false), Owner::Swallow);
+        assert_eq!(owner_now(19, false, false), Owner::UnitSelect);
+    }
+
     // B0.3: where the held-finger screens' cursor starts (it then moves
     // freely on the grid, like unit select's: the user's choice,
     // 2026-09-28).
@@ -1129,10 +1186,21 @@ mod tests {
         // When the next unit's turn comes, the cursor goes to it, not the
         // tile the last one was on.
         let grid = open_grid(8, 8);
-        assert_eq!(unit_select_start(&grid, Some((5, 6)), (1, 1)), (5, 6));
+        assert_eq!(unit_select_start(&grid, Some((5, 6)), (1, 1), false), (5, 6));
         // No selected unit: the game's cursor; hidden (−1) too: the middle.
-        assert_eq!(unit_select_start(&grid, None, (1, 1)), (1, 1));
-        assert_eq!(unit_select_start(&grid, Some((20, 20)), (-1, -1)), (4, 4));
+        assert_eq!(unit_select_start(&grid, None, (1, 1), false), (1, 1));
+        assert_eq!(unit_select_start(&grid, Some((20, 20)), (-1, -1), false), (4, 4));
+    }
+
+    #[test]
+    fn a_new_turn_starts_on_the_games_cursor() {
+        // After the enemy's turn the selected unit is still the enemy that
+        // acted last, while the game's cursor is on the player's first
+        // unit (2026-09-28 log: selected (2, 6), cursor (2, 8)).
+        let grid = open_grid(10, 10);
+        assert_eq!(unit_select_start(&grid, Some((2, 6)), (2, 8), true), (2, 8));
+        // A hidden cursor still falls back to the selected unit.
+        assert_eq!(unit_select_start(&grid, Some((2, 6)), (-1, -1), true), (2, 6));
     }
 
     #[test]
@@ -1260,7 +1328,69 @@ mod tests {
             want_down: true,
             act: false,
             last_pan: None,
+            hold_area: WHOLE_SCREEN,
+            harmless_area: HARMLESS_AREA,
         }
+    }
+
+    // Unit select on the held finger (the user's choice, 2026-09-28): the
+    // game's own cursor, drawn under the units, instead of touchHLE's.
+
+    #[test]
+    fn unit_selects_hold_area_is_where_holds_were_verified() {
+        // The same tiles `holdable` allows (the finger at or above 248).
+        for x in (0..=480).step_by(4) {
+            for y in (0..=320).step_by(4) {
+                let centre = (x as f32, y as f32);
+                assert_eq!(holdable_in(centre, UNIT_SELECT_HOLD), holdable(centre), "{centre:?}");
+            }
+        }
+    }
+
+    fn unit_view<'a>(
+        camera: &'a Camera,
+        grid: &'a Grid,
+        units: &'a [Tile],
+        cursor: Tile,
+        finger: Option<Point>,
+    ) -> FollowView<'a> {
+        FollowView {
+            hold_area: UNIT_SELECT_HOLD,
+            harmless_area: TAP_AREA,
+            ..view(camera, grid, units, Some(cursor), finger)
+        }
+    }
+
+    #[test]
+    fn unit_select_lets_go_off_the_units_above_the_panel() {
+        // Coming up (for L/R, MENU or a zoom), the finger lets go on a tile
+        // with no unit, and above the status panel, MENU and the arrows.
+        let (camera, grid) = (follow_camera(), open_grid(10, 10));
+        let units = [(3, 3), (4, 4), (3, 4), (4, 3)];
+        let mut v = unit_view(&camera, &grid, &units, (3, 3), Some(camera.hold_point((3, 3))));
+        v.want_down = false;
+        let FollowAction::LiftAt((x, y)) = follow(&v) else {
+            panic!("{:?}", follow(&v));
+        };
+        assert!(!units.contains(&camera.hold_tile_at((x, y))));
+        assert!(tappable((x, y)), "{:?}", (x, y));
+    }
+
+    #[test]
+    fn unit_select_taps_a_tile_too_low_to_hold() {
+        // Tile (8, 8)'s centre is at y 232: its finger would be on the
+        // status panel. With the map at its edge (no pan), confirm taps.
+        let (camera, grid) = (follow_camera(), open_grid(10, 10));
+        let tile = (8, 8);
+        let units = [tile];
+        let mut v = unit_view(&camera, &grid, &units, tile, None);
+        v.last_pan = Some(camera.origin);
+        assert_eq!(follow(&v), FollowAction::Stuck);
+        v.act = true;
+        assert_eq!(follow(&v), FollowAction::Tap(camera.tile_centre(tile)));
+        // A pan first, while one still moves the map.
+        v.last_pan = None;
+        assert!(matches!(follow(&v), FollowAction::Pan(..)), "{:?}", follow(&v));
     }
 
     #[test]

@@ -19,6 +19,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+/// Single files from the repo root that go next to the exe. CREDITS.txt
+/// carries the credits and the Square Enix notice, readable without
+/// starting the game.
+const SHIPPED_FILES: &[&str] = &["touchHLE_default_options.txt", "CREDITS.txt"];
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -85,10 +90,9 @@ fn build_windows(release: bool) -> Result<(), String> {
     copy_file(&exe, &out.join(&exe_name))?;
     copy_dir(&root.join("touchHLE_dylibs"), &out.join("touchHLE_dylibs"))?;
     copy_dir(&root.join("touchHLE_fonts"), &out.join("touchHLE_fonts"))?;
-    copy_file(
-        &root.join("touchHLE_default_options.txt"),
-        &out.join("touchHLE_default_options.txt"),
-    )?;
+    for name in SHIPPED_FILES {
+        copy_file(&root.join(name), &out.join(name))?;
+    }
     // touchHLE_options.txt and OPTIONS_HELP.txt are left out on purpose:
     // paths.rs writes them on first launch if missing, and copying them
     // would clobber the user's edits on every build.
@@ -137,4 +141,23 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
 
 fn io_err(what: &str, path: &Path, e: std::io::Error) -> String {
     format!("couldn't {what} {}: {e}", path.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_credits_ship_with_the_game() {
+        assert!(SHIPPED_FILES.contains(&"CREDITS.txt"));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        for name in SHIPPED_FILES {
+            assert!(root.join(name).is_file(), "{name} is missing");
+        }
+    }
+
+    #[test]
+    fn the_game_never_ships() {
+        assert!(!SHIPPED_FILES.iter().any(|f| f.to_lowercase().ends_with(".ipa")));
+    }
 }
